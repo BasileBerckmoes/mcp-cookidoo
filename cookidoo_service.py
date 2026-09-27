@@ -250,6 +250,49 @@ def build_instruction(text: str, ingredients: list[str]) -> dict:
     }
 
 
+def _build_recipe_payload(
+    *,
+    name: str,
+    ingredients: list[str],
+    steps: list[str],
+    servings: int,
+    prep_time_seconds: int,
+    total_time_seconds: int,
+    hints: Optional[list[str] | str] = None,
+    tools: Optional[list[str]] = None,
+    image: Optional[str] = None,
+    cook_time_seconds: int = 0,
+) -> dict:
+    """Build the PATCH body for /created-recipes/{locale}/{id}.
+
+    Extracted from :meth:`CookidooService.create_custom_recipe` so
+    :meth:`CookidooService.update_custom_recipe` can reuse the same shape.
+    Times are seconds — payload-native — to avoid hidden minute↔second
+    conversions inside the helper; callers convert at their boundary.
+    Steps go through :func:`normalize_action_step` and :func:`build_instruction`
+    so TTS/MODE/INGREDIENT annotations are rebuilt on every write (the read
+    endpoint strips them, so read-modify-write flows re-derive them here).
+    """
+    return {
+        "name": name,
+        "image": image,
+        "isImageOwnedByUser": image is not None,
+        "tools": tools if tools else ["TM7", "TM6", "TM5"],
+        "yield": {"value": servings, "unitText": "portion"},
+        "prepTime": prep_time_seconds,
+        "cookTime": cook_time_seconds,
+        "totalTime": total_time_seconds,
+        "ingredients": [{"type": "INGREDIENT", "text": ing} for ing in ingredients],
+        "instructions": [
+            build_instruction(normalize_action_step(step), ingredients)
+            for step in steps
+        ],
+        "hints": "\n".join(hints) if hints and isinstance(hints, list) else (hints if hints else ""),
+        "workStatus": "PRIVATE",
+        "recipeMetadata": {"requiresAnnotationsCheck": False},
+    }
+
+
 def load_cookidoo_credentials() -> tuple[str, str]:
     """
     Load Cookidoo credentials from .env file.
@@ -423,24 +466,16 @@ class CookidooService:
                 raise Exception("No recipe ID returned from creation")
 
             update_url = f"{base_url}/created-recipes/{locale}/{recipe_id}"
-            update_data = {
-                "name": name,
-                "image": None,
-                "isImageOwnedByUser": False,
-                "tools": tools if tools else ["TM7", "TM6", "TM5"],
-                "yield": {"value": servings, "unitText": "portion"},
-                "prepTime": prep_time * 60,
-                "cookTime": 0,
-                "totalTime": total_time * 60,
-                "ingredients": [{"type": "INGREDIENT", "text": ing} for ing in ingredients],
-                "instructions": [
-                    build_instruction(normalize_action_step(step), ingredients)
-                    for step in steps
-                ],
-                "hints": "\n".join(hints) if hints and isinstance(hints, list) else (hints if hints else ""),
-                "workStatus": "PRIVATE",
-                "recipeMetadata": {"requiresAnnotationsCheck": False},
-            }
+            update_data = _build_recipe_payload(
+                name=name,
+                ingredients=ingredients,
+                steps=steps,
+                servings=servings,
+                prep_time_seconds=prep_time * 60,
+                total_time_seconds=total_time * 60,
+                hints=hints,
+                tools=tools,
+            )
 
             # Give the backend time to materialize the recipe created by the POST
             # above — PATCHing immediately after creation is unreliable.
@@ -507,6 +542,91 @@ class CookidooService:
             "image": recipe.image,
             "url": recipe.url,
         }
+
+    async def update_custom_recipe(self, recipe_id: str, recipe) -> None:
+        """PATCH an existing custom recipe with a full recipe body.
+
+        ``recipe`` is a :class:`schemas.CustomRecipe`. The PATCH body is built
+        via :func:`_build_recipe_payload` and then trimmed of the fields
+        :class:`schemas.CustomRecipe` can't safely source from the caller:
+
+        - ``image`` / ``isImageOwnedByUser`` — not in :class:`CustomRecipe`;
+          sending ``image: None`` would wipe any user-uploaded image.
+        - ``cookTime`` — not in :class:`CustomRecipe`; sending ``0`` would
+          wipe any non-zero cook time the recipe had.
+        - ``hints`` — omitted when ``recipe.hints is None``. The read
+          endpoint doesn't return hints (see finding
+          ``2026-09-27-custom-recipe-read-schema.md``), so callers can't
+          preserve them via read-modify-write. ``hints=None`` therefore means
+          "leave alone"; ``hints=[]`` explicitly clears; a populated list
+          writes.
+
+        Partial-PATCH semantics (finding
+        ``2026-09-27-custom-recipe-partial-patch.md``) mean the backend
+        leaves any field we don't send untouched, which is what makes this
+        safe. No POST, no 5-second sleep — those are create-time race
+        workarounds. Refresh-on-401 is handled by :meth:`_authed_request`.
+        """
+        if not self._api_client or not self._session:
+            raise Exception("Not authenticated. Please call login() first.")
+
+        localization = self._api_client.localization
+        url_parts = localization.url.split("/")
+        base_url = f"{url_parts[0]}//{url_parts[2]}"
+        locale = localization.language
+        url = f"{base_url}/created-recipes/{locale}/{recipe_id}"
+
+        body = _build_recipe_payload(
+            name=recipe.name,
+            ingredients=recipe.ingredients,
+            steps=recipe.steps,
+            servings=recipe.servings,
+            prep_time_seconds=recipe.prep_time * 60,
+            total_time_seconds=recipe.total_time * 60,
+            hints=recipe.hints,
+            tools=recipe.tools,
+        )
+        # Fields the caller can't safely control via CustomRecipe; omitting
+        # them keeps whatever the backend already has.
+        for key in ("image", "isImageOwnedByUser", "cookTime"):
+            body.pop(key, None)
+        if recipe.hints is None:
+            body.pop("hints", None)
+
+        status, text = await self._authed_request("PATCH", url, json_body=body)
+        if status not in (200, 204):
+            raise Exception(
+                f"Failed to update recipe. Status: {status}, Error: {text}"
+            )
+
+    async def rename_custom_recipe(self, recipe_id: str, new_name: str) -> None:
+        """Rename a custom recipe with a single partial PATCH.
+
+        The backend accepts partial PATCH bodies for this endpoint and leaves
+        every other field on the recipe untouched — probed against the real
+        account (see ``.claude/docs/findings/2026-09-27-custom-recipe-partial-patch.md``).
+        A full-body read-then-write would risk annotation drift, since the
+        schema.org GET strips annotations and we'd have to rebuild them from
+        raw step text; partial PATCH avoids that entirely.
+        """
+        if not isinstance(new_name, str) or not new_name.strip():
+            raise ValueError("new_name must be a non-empty string")
+        if not self._api_client or not self._session:
+            raise Exception("Not authenticated. Please call login() first.")
+
+        localization = self._api_client.localization
+        url_parts = localization.url.split("/")
+        base_url = f"{url_parts[0]}//{url_parts[2]}"
+        locale = localization.language
+        url = f"{base_url}/created-recipes/{locale}/{recipe_id}"
+
+        status, text = await self._authed_request(
+            "PATCH", url, json_body={"name": new_name}
+        )
+        if status not in (200, 204):
+            raise Exception(
+                f"Failed to rename recipe. Status: {status}, Error: {text}"
+            )
 
     async def delete_custom_recipe(self, recipe_id: str) -> None:
         """Delete one of the user's custom recipes by ID. Refreshes the access
