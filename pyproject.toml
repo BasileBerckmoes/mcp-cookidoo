@@ -1,0 +1,11 @@
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests", "test_auth_refresh.py"]
+markers = [
+    "integration: hits the real Cookidoo API; skipped unless COOKIDOO_INTEGRATION=1",
+]
+asyncio_mode = "auto"
+filterwarnings = [
+    "error::DeprecationWarning:cookidoo_service",
+    "error::DeprecationWarning:server",
+]
