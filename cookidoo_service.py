@@ -250,6 +250,49 @@ def build_instruction(text: str, ingredients: list[str]) -> dict:
     }
 
 
+def _build_recipe_payload(
+    *,
+    name: str,
+    ingredients: list[str],
+    steps: list[str],
+    servings: int,
+    prep_time_seconds: int,
+    total_time_seconds: int,
+    hints: Optional[list[str] | str] = None,
+    tools: Optional[list[str]] = None,
+    image: Optional[str] = None,
+    cook_time_seconds: int = 0,
+) -> dict:
+    """Build the PATCH body for /created-recipes/{locale}/{id}.
+
+    Extracted from :meth:`CookidooService.create_custom_recipe` so
+    :meth:`CookidooService.update_custom_recipe` can reuse the same shape.
+    Times are seconds — payload-native — to avoid hidden minute↔second
+    conversions inside the helper; callers convert at their boundary.
+    Steps go through :func:`normalize_action_step` and :func:`build_instruction`
+    so TTS/MODE/INGREDIENT annotations are rebuilt on every write (the read
+    endpoint strips them, so read-modify-write flows re-derive them here).
+    """
+    return {
+        "name": name,
+        "image": image,
+        "isImageOwnedByUser": image is not None,
+        "tools": tools if tools else ["TM7", "TM6", "TM5"],
+        "yield": {"value": servings, "unitText": "portion"},
+        "prepTime": prep_time_seconds,
+        "cookTime": cook_time_seconds,
+        "totalTime": total_time_seconds,
+        "ingredients": [{"type": "INGREDIENT", "text": ing} for ing in ingredients],
+        "instructions": [
+            build_instruction(normalize_action_step(step), ingredients)
+            for step in steps
+        ],
+        "hints": "\n".join(hints) if hints and isinstance(hints, list) else (hints if hints else ""),
+        "workStatus": "PRIVATE",
+        "recipeMetadata": {"requiresAnnotationsCheck": False},
+    }
+
+
 def load_cookidoo_credentials() -> tuple[str, str]:
     """
     Load Cookidoo credentials from .env file.
@@ -423,24 +466,16 @@ class CookidooService:
                 raise Exception("No recipe ID returned from creation")
 
             update_url = f"{base_url}/created-recipes/{locale}/{recipe_id}"
-            update_data = {
-                "name": name,
-                "image": None,
-                "isImageOwnedByUser": False,
-                "tools": tools if tools else ["TM7", "TM6", "TM5"],
-                "yield": {"value": servings, "unitText": "portion"},
-                "prepTime": prep_time * 60,
-                "cookTime": 0,
-                "totalTime": total_time * 60,
-                "ingredients": [{"type": "INGREDIENT", "text": ing} for ing in ingredients],
-                "instructions": [
-                    build_instruction(normalize_action_step(step), ingredients)
-                    for step in steps
-                ],
-                "hints": "\n".join(hints) if hints and isinstance(hints, list) else (hints if hints else ""),
-                "workStatus": "PRIVATE",
-                "recipeMetadata": {"requiresAnnotationsCheck": False},
-            }
+            update_data = _build_recipe_payload(
+                name=name,
+                ingredients=ingredients,
+                steps=steps,
+                servings=servings,
+                prep_time_seconds=prep_time * 60,
+                total_time_seconds=total_time * 60,
+                hints=hints,
+                tools=tools,
+            )
 
             # Give the backend time to materialize the recipe created by the POST
             # above — PATCHing immediately after creation is unreliable.
