@@ -313,7 +313,7 @@ class CookidooService:
                 email=self.email,
                 password=self.password,
                 localization=(
-                    await get_localization_options(country="ch", language="de-CH")
+                    await get_localization_options(country=os.getenv("COOKIDOO_COUNTRY", "ch"), language=os.getenv("COOKIDOO_LANGUAGE", "de-CH"))
                 )[0],
             )
             

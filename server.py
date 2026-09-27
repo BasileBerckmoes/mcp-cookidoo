@@ -48,7 +48,7 @@ async def _ensure_connected() -> tuple[Optional[str], Optional[CookidooService]]
     """
     global _cookidoo_service, _cookidoo_api
     if _cookidoo_service and _cookidoo_api:
-        if _cookidoo_api.expires_in > TOKEN_REFRESH_BUFFER_SECONDS:
+        if not _cookidoo_api._is_token_expiring():
             return None, _cookidoo_service
         try:
             await _cookidoo_api.refresh_token()
@@ -293,7 +293,7 @@ async def generate_recipe_structure(
             if ing.strip()
         ]
         steps_list = [
-            step.strip().lstrip("0123456789.)-• \t")
+            re.sub(r"^\s*(?:\d+[.)]|[-•])\s+", "", step).strip()
             for step in steps.split("\n")
             if step.strip()
         ]
