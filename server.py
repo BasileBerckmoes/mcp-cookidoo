@@ -95,6 +95,7 @@ def _score_recipe(recipe: CustomRecipe) -> dict:
     parallelization (Varoma / Gareinsatz).
     """
     steps = recipe.steps
+    step_texts = [s.text for s in steps]
     ingredients = recipe.ingredients
     n = len(steps)
     if n == 0:
@@ -108,25 +109,33 @@ def _score_recipe(recipe: CustomRecipe) -> dict:
     issues: list[str] = []
     suggestions: list[str] = []
 
-    # Parse each step and count action hits (TTS or MODE — both render with play button)
+    # Count action hits: a structured action counts directly; otherwise fall
+    # through to the German-text parser (backwards-compatible).
     tts_step_count = 0
     ingredient_hit_steps = 0
     for step in steps:
-        anns = build_step_annotations(step, ingredients)
-        if any(a["type"] in ("TTS", "MODE") for a in anns):
+        if step.action is not None:
             tts_step_count += 1
-        if any(a["type"] == "INGREDIENT" for a in anns):
-            ingredient_hit_steps += 1
+            if any(ing and ing in step.text for ing in ingredients):
+                ingredient_hit_steps += 1
+        else:
+            anns = build_step_annotations(step.text, ingredients)
+            if any(a["type"] in ("TTS", "MODE") for a in anns):
+                tts_step_count += 1
+            if any(a["type"] == "INGREDIENT" for a in anns):
+                ingredient_hit_steps += 1
 
     # Estimate how many action-steps the recipe SHOULD have: roughly half the
     # steps should be actions (alternating prose/action pattern).
     expected_actions = max(1, n // 2)
 
-    has_accessory = any(_ACCESSORY_RE.search(s) for s in steps)
-    has_parallel = any(_PARALLEL_RE.search(s) for s in steps)
-    has_varoma = any(re.search(r"varoma", s, re.IGNORECASE) for s in steps)
+    has_accessory = any(_ACCESSORY_RE.search(s) for s in step_texts)
+    has_parallel = any(_PARALLEL_RE.search(s) for s in step_texts)
+    has_varoma = any(re.search(r"varoma", s, re.IGNORECASE) for s in step_texts) or any(
+        s.action is not None and s.action.kind == "steaming" for s in steps
+    )
     has_butterfly = any(
-        re.search(r"schmetterling|butterfly", s, re.IGNORECASE) for s in steps
+        re.search(r"schmetterling|butterfly", s, re.IGNORECASE) for s in step_texts
     )
 
     # Points 1: TTS-parseable action steps (50 pts — the big one)
@@ -178,7 +187,7 @@ def _score_recipe(recipe: CustomRecipe) -> dict:
 
     score = tts_points + ing_points + accessory_points + parallel_points
 
-    text_all = " ".join(steps).lower()
+    text_all = " ".join(step_texts).lower()
     if ("sahne" in text_all or "eiweiß" in text_all or "eischnee" in text_all or "cream" in text_all) and not has_butterfly:
         suggestions.append("Bei Sahne/Eischnee: Schmetterling einsetzen.")
     if ("teig" in text_all or "dough" in text_all) and not re.search(
