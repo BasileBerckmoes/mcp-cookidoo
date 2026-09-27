@@ -467,6 +467,47 @@ class CookidooService:
         except Exception as e:
             raise Exception(f"Failed to create custom recipe: {str(e)}") from e
 
+    async def get_custom_recipe(self, recipe_id: str) -> dict:
+        """Read one of the user's custom recipes by ID.
+
+        Uses ``cookidoo-api``'s ``Cookidoo.get_custom_recipe`` and projects
+        the returned ``CookidooCustomRecipe`` dataclass into a dict whose
+        keys mirror the PATCH payload built by :meth:`create_custom_recipe`,
+        so callers can read → mutate → write symmetrically.
+
+        The backend read endpoint returns a schema.org projection that omits
+        two fields we send on PATCH: ``hints`` and ``cookTime``. It also
+        strips step annotations from ``instructions``. Both are documented
+        limitations — a read-modify-write flow must rebuild annotations from
+        the raw step text via :func:`build_instruction`. See
+        ``.claude/docs/findings/2026-09-27-custom-recipe-read-schema.md``.
+
+        Retries once after ``refresh_token()`` on ``CookidooAuthException``,
+        matching :meth:`delete_custom_recipe`.
+        """
+        if not self._api_client:
+            raise Exception("Not authenticated. Please call login() first.")
+        try:
+            recipe = await self._api_client.get_custom_recipe(recipe_id)
+        except CookidooAuthException:
+            await self._api_client.refresh_token()
+            recipe = await self._api_client.get_custom_recipe(recipe_id)
+
+        return {
+            "id": recipe.id,
+            "name": recipe.name,
+            "ingredients": list(recipe.ingredients),
+            "instructions": list(recipe.instructions),
+            "yield": {"value": recipe.serving_size, "unitText": "portion"},
+            "prepTime": recipe.active_time,
+            "cookTime": None,
+            "totalTime": recipe.total_time,
+            "tools": list(recipe.tools),
+            "hints": None,
+            "image": recipe.image,
+            "url": recipe.url,
+        }
+
     async def delete_custom_recipe(self, recipe_id: str) -> None:
         """Delete one of the user's custom recipes by ID. Refreshes the access
         token once if the library reports an auth failure (expired token)."""
