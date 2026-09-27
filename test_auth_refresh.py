@@ -74,6 +74,7 @@ class TestEnsureConnectedProactiveRefresh(unittest.IsolatedAsyncioTestCase):
              patch("server.CookidooService") as MockSvc:
             mock_api = MagicMock()
             mock_api.expires_in = 3600
+            mock_api._is_token_expiring.return_value = False
             mock_svc = MockSvc.return_value
             mock_svc.login = AsyncMock(return_value=mock_api)
 
@@ -88,6 +89,7 @@ class TestEnsureConnectedProactiveRefresh(unittest.IsolatedAsyncioTestCase):
         mock_svc = MagicMock()
         mock_api = MagicMock()
         mock_api.expires_in = 3600
+        mock_api._is_token_expiring.return_value = False
         mock_api.refresh_token = AsyncMock()
         self.server._cookidoo_service = mock_svc
         self.server._cookidoo_api = mock_api
@@ -102,7 +104,8 @@ class TestEnsureConnectedProactiveRefresh(unittest.IsolatedAsyncioTestCase):
         """Cache + token within buffer → refresh_token() runs, no full re-login."""
         mock_svc = MagicMock()
         mock_api = MagicMock()
-        mock_api.expires_in = 30  # below 60s buffer
+        mock_api.expires_in = 30  # below cookidoo-api's TOKEN_EXPIRY_MARGIN
+        mock_api._is_token_expiring.return_value = True
         mock_api.refresh_token = AsyncMock()
         self.server._cookidoo_service = mock_svc
         self.server._cookidoo_api = mock_api
@@ -123,6 +126,7 @@ class TestEnsureConnectedProactiveRefresh(unittest.IsolatedAsyncioTestCase):
         mock_svc = MagicMock()
         mock_api = MagicMock()
         mock_api.expires_in = 0
+        mock_api._is_token_expiring.return_value = True
         mock_api.refresh_token = AsyncMock()
         self.server._cookidoo_service = mock_svc
         self.server._cookidoo_api = mock_api
@@ -138,6 +142,7 @@ class TestEnsureConnectedProactiveRefresh(unittest.IsolatedAsyncioTestCase):
         mock_svc.close = AsyncMock()
         mock_api = MagicMock()
         mock_api.expires_in = 30
+        mock_api._is_token_expiring.return_value = True
         mock_api.refresh_token = AsyncMock(side_effect=CookidooAuthException("refresh token rejected"))
         self.server._cookidoo_service = mock_svc
         self.server._cookidoo_api = mock_api
@@ -146,6 +151,7 @@ class TestEnsureConnectedProactiveRefresh(unittest.IsolatedAsyncioTestCase):
              patch("server.CookidooService") as MockSvc:
             new_api = MagicMock()
             new_api.expires_in = 3600
+            new_api._is_token_expiring.return_value = False
             new_svc = MockSvc.return_value
             new_svc.login = AsyncMock(return_value=new_api)
 
