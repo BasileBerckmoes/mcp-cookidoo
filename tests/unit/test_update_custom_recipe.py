@@ -46,6 +46,18 @@ def _sample_recipe() -> CustomRecipe:
     )
 
 
+def _sample_recipe_no_hints() -> CustomRecipe:
+    return CustomRecipe(
+        name="Updated Recipe",
+        ingredients=["100 g water"],
+        steps=["Water into the mixing bowl."],
+        servings=2,
+        prep_time=1,
+        total_time=3,
+        tools=["TM7"],
+    )
+
+
 async def test_patches_correct_url_and_body() -> None:
     captured: dict[str, Any] = {}
 
@@ -63,8 +75,10 @@ async def test_patches_correct_url_and_body() -> None:
 
     assert captured["method"] == "PATCH"
     assert captured["url"] == "https://cookidoo.be/created-recipes/nl-BE/01ABC"
-    # Body equals what _build_recipe_payload produces for the same inputs,
-    # with the CustomRecipe's minutes converted to seconds by the service.
+    # Body is _build_recipe_payload's output with the fields update can't
+    # safely write stripped — image/isImageOwnedByUser/cookTime always,
+    # hints only when the recipe carries them. See docstring on
+    # update_custom_recipe for why.
     expected = _build_recipe_payload(
         name=recipe.name,
         ingredients=recipe.ingredients,
@@ -75,7 +89,80 @@ async def test_patches_correct_url_and_body() -> None:
         hints=recipe.hints,
         tools=recipe.tools,
     )
+    for k in ("image", "isImageOwnedByUser", "cookTime"):
+        expected.pop(k, None)
     assert captured["json_body"] == expected
+
+
+async def test_does_not_send_image_hints_or_cook_time_fields() -> None:
+    """Direct guard on the omission set. Any regression that reintroduces one
+    of these keys risks wiping the backend's stored value on every update,
+    since our CustomRecipe schema can't source them from the caller (image and
+    cookTime not at all; hints not observable via GET, so a read-modify-write
+    couldn't preserve them either). See finding
+    2026-09-27-custom-recipe-partial-patch.md."""
+    captured: dict[str, Any] = {}
+
+    async def fake_authed_request(self, method, url, *, json_body=None, accept="application/json"):
+        captured["json_body"] = json_body
+        return 200, "{}"
+
+    svc = _service_with_fake_client()
+    svc._authed_request = fake_authed_request.__get__(svc, CookidooService)  # type: ignore[assignment]
+
+    await svc.update_custom_recipe("01ABC", _sample_recipe_no_hints())
+
+    body = captured["json_body"]
+    assert "image" not in body
+    assert "isImageOwnedByUser" not in body
+    assert "cookTime" not in body
+    assert "hints" not in body
+
+
+async def test_sends_hints_when_recipe_carries_them() -> None:
+    """When the caller supplies hints, we DO send them — otherwise there's no
+    way to update hints on an existing recipe. `hints is None` (the pydantic
+    default) is the "leave hints alone" signal; a populated list writes."""
+    captured: dict[str, Any] = {}
+
+    async def fake_authed_request(self, method, url, *, json_body=None, accept="application/json"):
+        captured["json_body"] = json_body
+        return 200, "{}"
+
+    svc = _service_with_fake_client()
+    svc._authed_request = fake_authed_request.__get__(svc, CookidooService)  # type: ignore[assignment]
+
+    recipe = _sample_recipe()  # has hints=["one hint"]
+    await svc.update_custom_recipe("01ABC", recipe)
+
+    assert captured["json_body"]["hints"] == "one hint"
+
+
+async def test_empty_hints_list_clears_hints() -> None:
+    """Explicit intent: `hints=[]` sends an empty string, clearing whatever
+    the backend had. Distinct from `hints=None` (leave alone). Documents the
+    3-state semantics for callers."""
+    captured: dict[str, Any] = {}
+
+    async def fake_authed_request(self, method, url, *, json_body=None, accept="application/json"):
+        captured["json_body"] = json_body
+        return 200, "{}"
+
+    svc = _service_with_fake_client()
+    svc._authed_request = fake_authed_request.__get__(svc, CookidooService)  # type: ignore[assignment]
+
+    recipe = CustomRecipe(
+        name="R",
+        ingredients=["x"],
+        steps=["y"],
+        servings=1,
+        prep_time=1,
+        total_time=1,
+        hints=[],  # explicit clear
+    )
+    await svc.update_custom_recipe("01ABC", recipe)
+
+    assert captured["json_body"]["hints"] == ""
 
 
 async def test_accepts_200_and_204() -> None:

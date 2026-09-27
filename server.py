@@ -475,9 +475,10 @@ async def update_custom_recipe(
     set force_upload=True to override a sub-bar score. For a name-only change,
     use rename_custom_recipe instead — it's a single partial PATCH.
 
-    Note: the recipe's uploaded image (if any) is NOT preserved by this call —
-    the update sends `image: null`, matching what create sends. Use
-    rename_custom_recipe when you want to preserve the image.
+    Preserves fields that CustomRecipe can't carry: any uploaded image and
+    cookTime survive the update untouched. `hints` are also left alone when
+    omitted from recipe_json — pass `"hints": []` to explicitly clear them,
+    or a populated list to overwrite.
     """
     error, service = await _ensure_connected()
     if error:

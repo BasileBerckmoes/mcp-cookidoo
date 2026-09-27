@@ -63,7 +63,7 @@ Let Claude read recipes from your Cookidoo account and create new TM7-optimized 
 | `generate_recipe_structure(...)` | Parse + validate recipe data into the upload JSON schema. |
 | `validate_recipe_quality(recipe_json)` | Score recipe against TM7 criteria with suggestions. |
 | `upload_custom_recipe(recipe_json, force_upload=false)` | Upload to the user's account. Quality-gated, with rollback on failure. |
-| `update_custom_recipe(recipe_id, recipe_json, force_upload=false)` | Replace an existing recipe with a new body. Quality-gated. Image is not preserved (sends `image: null`) — use `rename_custom_recipe` if you only need to change the name. |
+| `update_custom_recipe(recipe_id, recipe_json, force_upload=false)` | Replace an existing recipe with a new body. Quality-gated. Preserves any uploaded image and `cookTime`; `hints` are preserved when omitted from `recipe_json` (pass `"hints": []` to clear). |
 | `rename_custom_recipe(recipe_id, new_name)` | Rename a custom recipe. Single partial PATCH — every other field (ingredients, steps + annotations, image, times, tools) is preserved. |
 | `list_my_custom_recipes()` | List custom recipes in the account. |
 | `delete_custom_recipe(recipe_id)` | Delete a custom recipe. Irreversible. |

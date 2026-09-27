@@ -546,12 +546,26 @@ class CookidooService:
     async def update_custom_recipe(self, recipe_id: str, recipe) -> None:
         """PATCH an existing custom recipe with a full recipe body.
 
-        ``recipe`` is a :class:`schemas.CustomRecipe`; the payload is built via
-        :func:`_build_recipe_payload` so this is symmetric with
-        :meth:`create_custom_recipe`'s PATCH. No POST, no 5-second sleep —
-        those are create-time race workarounds and don't apply to an
-        already-materialized recipe. Refresh-on-401 is handled by
-        :meth:`_authed_request`.
+        ``recipe`` is a :class:`schemas.CustomRecipe`. The PATCH body is built
+        via :func:`_build_recipe_payload` and then trimmed of the fields
+        :class:`schemas.CustomRecipe` can't safely source from the caller:
+
+        - ``image`` / ``isImageOwnedByUser`` — not in :class:`CustomRecipe`;
+          sending ``image: None`` would wipe any user-uploaded image.
+        - ``cookTime`` — not in :class:`CustomRecipe`; sending ``0`` would
+          wipe any non-zero cook time the recipe had.
+        - ``hints`` — omitted when ``recipe.hints is None``. The read
+          endpoint doesn't return hints (see finding
+          ``2026-09-27-custom-recipe-read-schema.md``), so callers can't
+          preserve them via read-modify-write. ``hints=None`` therefore means
+          "leave alone"; ``hints=[]`` explicitly clears; a populated list
+          writes.
+
+        Partial-PATCH semantics (finding
+        ``2026-09-27-custom-recipe-partial-patch.md``) mean the backend
+        leaves any field we don't send untouched, which is what makes this
+        safe. No POST, no 5-second sleep — those are create-time race
+        workarounds. Refresh-on-401 is handled by :meth:`_authed_request`.
         """
         if not self._api_client or not self._session:
             raise Exception("Not authenticated. Please call login() first.")
@@ -572,6 +586,13 @@ class CookidooService:
             hints=recipe.hints,
             tools=recipe.tools,
         )
+        # Fields the caller can't safely control via CustomRecipe; omitting
+        # them keeps whatever the backend already has.
+        for key in ("image", "isImageOwnedByUser", "cookTime"):
+            body.pop(key, None)
+        if recipe.hints is None:
+            body.pop("hints", None)
+
         status, text = await self._authed_request("PATCH", url, json_body=body)
         if status not in (200, 204):
             raise Exception(

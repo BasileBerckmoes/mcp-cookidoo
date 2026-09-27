@@ -39,6 +39,20 @@ async def test_update_round_trips_through_get() -> None:
         )
         assert recipe_id
 
+        # Snapshot pre-update state to smoke-check image survives the update.
+        # NOTE: this is a weak signal because the backend normalizes stored
+        # `image: null` to the placeholder URL on GET, so a placeholder→
+        # placeholder round-trip is indistinguishable from a wiped image. The
+        # real regression guard is the unit-test omission set in
+        # tests/unit/test_update_custom_recipe.py. Verified once locally by
+        # reverse-running the test pre-fix: it also passed. For a real user-
+        # uploaded image (which we can't seed programmatically because the
+        # backend's image field only accepts its own CDN paths from the upload
+        # endpoint), the pre-fix behavior would wipe the URL — that path must
+        # be checked manually on the VM.
+        before = await service.get_custom_recipe(recipe_id)
+        assert before["image"], "expected the placeholder image URL on create"
+
         updated = CustomRecipe(
             name="__TEST__ update after",
             ingredients=["200 g water", "5 g salt"],
@@ -68,6 +82,9 @@ async def test_update_round_trips_through_get() -> None:
         assert after["prepTime"] == 120
         assert after["totalTime"] == 300
         assert after["tools"] == ["TM7", "TM6"]
+        # Image URL must survive the update — the whole point of the partial-
+        # PATCH omission for `image` / `isImageOwnedByUser`.
+        assert after["image"] == before["image"]
     finally:
         if recipe_id:
             try:
