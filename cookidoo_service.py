@@ -543,6 +543,70 @@ class CookidooService:
             "url": recipe.url,
         }
 
+    async def update_custom_recipe(self, recipe_id: str, recipe) -> None:
+        """PATCH an existing custom recipe with a full recipe body.
+
+        ``recipe`` is a :class:`schemas.CustomRecipe`; the payload is built via
+        :func:`_build_recipe_payload` so this is symmetric with
+        :meth:`create_custom_recipe`'s PATCH. No POST, no 5-second sleep —
+        those are create-time race workarounds and don't apply to an
+        already-materialized recipe. Refresh-on-401 is handled by
+        :meth:`_authed_request`.
+        """
+        if not self._api_client or not self._session:
+            raise Exception("Not authenticated. Please call login() first.")
+
+        localization = self._api_client.localization
+        url_parts = localization.url.split("/")
+        base_url = f"{url_parts[0]}//{url_parts[2]}"
+        locale = localization.language
+        url = f"{base_url}/created-recipes/{locale}/{recipe_id}"
+
+        body = _build_recipe_payload(
+            name=recipe.name,
+            ingredients=recipe.ingredients,
+            steps=recipe.steps,
+            servings=recipe.servings,
+            prep_time_seconds=recipe.prep_time * 60,
+            total_time_seconds=recipe.total_time * 60,
+            hints=recipe.hints,
+            tools=recipe.tools,
+        )
+        status, text = await self._authed_request("PATCH", url, json_body=body)
+        if status not in (200, 204):
+            raise Exception(
+                f"Failed to update recipe. Status: {status}, Error: {text}"
+            )
+
+    async def rename_custom_recipe(self, recipe_id: str, new_name: str) -> None:
+        """Rename a custom recipe with a single partial PATCH.
+
+        The backend accepts partial PATCH bodies for this endpoint and leaves
+        every other field on the recipe untouched — probed against the real
+        account (see ``.claude/docs/findings/2026-09-27-custom-recipe-partial-patch.md``).
+        A full-body read-then-write would risk annotation drift, since the
+        schema.org GET strips annotations and we'd have to rebuild them from
+        raw step text; partial PATCH avoids that entirely.
+        """
+        if not isinstance(new_name, str) or not new_name.strip():
+            raise ValueError("new_name must be a non-empty string")
+        if not self._api_client or not self._session:
+            raise Exception("Not authenticated. Please call login() first.")
+
+        localization = self._api_client.localization
+        url_parts = localization.url.split("/")
+        base_url = f"{url_parts[0]}//{url_parts[2]}"
+        locale = localization.language
+        url = f"{base_url}/created-recipes/{locale}/{recipe_id}"
+
+        status, text = await self._authed_request(
+            "PATCH", url, json_body={"name": new_name}
+        )
+        if status not in (200, 204):
+            raise Exception(
+                f"Failed to rename recipe. Status: {status}, Error: {text}"
+            )
+
     async def delete_custom_recipe(self, recipe_id: str) -> None:
         """Delete one of the user's custom recipes by ID. Refreshes the access
         token once if the library reports an auth failure (expired token)."""

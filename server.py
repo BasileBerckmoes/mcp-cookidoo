@@ -465,6 +465,88 @@ async def delete_custom_recipe(recipe_id: str) -> str:
 
 
 @mcp.tool()
+async def update_custom_recipe(
+    recipe_id: str, recipe_json: str, force_upload: bool = False
+) -> str:
+    """
+    Replace an existing custom recipe with a full new recipe body.
+
+    Same recipe schema as upload_custom_recipe. Runs the same TM7 quality gate;
+    set force_upload=True to override a sub-bar score. For a name-only change,
+    use rename_custom_recipe instead — it's a single partial PATCH.
+
+    Note: the recipe's uploaded image (if any) is NOT preserved by this call —
+    the update sends `image: null`, matching what create sends. Use
+    rename_custom_recipe when you want to preserve the image.
+    """
+    error, service = await _ensure_connected()
+    if error:
+        return error
+
+    try:
+        data = json.loads(recipe_json)
+        recipe = CustomRecipe(**data)
+    except json.JSONDecodeError as e:
+        return f"Invalid JSON: {e}"
+    except Exception as e:
+        return f"Invalid recipe data: {e}"
+
+    quality = _score_recipe(recipe)
+    if not quality["meets_bar"] and not force_upload:
+        lines = [
+            f"Update blocked — quality score {quality['score']}/100 below bar {QUALITY_BAR}.",
+            "",
+            "Issues:",
+        ]
+        for issue in quality["issues"]:
+            lines.append(f"  ✗ {issue}")
+        if quality["suggestions"]:
+            lines.append("")
+            lines.append("Suggestions:")
+            for s in quality["suggestions"]:
+                lines.append(f"  • {s}")
+        lines.append("")
+        lines.append(
+            "Revise the steps with Thermomix vocabulary and TM7 parallelization, "
+            "then call validate_recipe_quality again. To override, pass force_upload=true."
+        )
+        return "\n".join(lines)
+
+    try:
+        await service.update_custom_recipe(recipe_id, recipe)
+    except Exception as e:
+        return f"Update failed: {e}"
+
+    return (
+        f"Recipe {recipe_id} updated to '{recipe.name}' "
+        f"(quality {quality['score']}/100)."
+    )
+
+
+@mcp.tool()
+async def rename_custom_recipe(recipe_id: str, new_name: str) -> str:
+    """
+    Rename a custom recipe. Sends a partial PATCH with just the new name; every
+    other field on the recipe (ingredients, steps + their annotations, image,
+    times, tools) is preserved untouched by the backend. No quality gate —
+    a name change can't affect TM7 play-button rendering.
+
+    Use this for the common "just fix the title" case; use update_custom_recipe
+    when other fields also need to change.
+    """
+    error, service = await _ensure_connected()
+    if error:
+        return error
+    try:
+        await service.rename_custom_recipe(recipe_id, new_name)
+    except ValueError as e:
+        return f"Invalid name: {e}"
+    except Exception as e:
+        return f"Rename failed: {e}"
+    return f"Recipe {recipe_id} renamed to '{new_name}'."
+
+
+@mcp.tool()
 async def upload_custom_recipe(recipe_json: str, force_upload: bool = False) -> str:
     """
     Upload a recipe to the user's Cookidoo account.
