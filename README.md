@@ -58,7 +58,8 @@ Let Claude read recipes from your Cookidoo account and create new TM7-optimized 
 | Tool | Description |
 |------|-------------|
 | `connect_to_cookidoo()` | Verify credentials. Optional, other tools auto-connect. |
-| `get_recipe_details(recipe_id)` | Fetch an existing Cookidoo recipe by ID. |
+| `get_recipe_details(recipe_id)` | Fetch an existing Cookidoo recipe by ID (official content only). |
+| `get_custom_recipe(recipe_id)` | Fetch one of the user's own custom recipes. `hints`, `cookTime`, and step annotations are not exposed by the read endpoint. |
 | `generate_recipe_structure(...)` | Parse + validate recipe data into the upload JSON schema. |
 | `validate_recipe_quality(recipe_json)` | Score recipe against TM7 criteria with suggestions. |
 | `upload_custom_recipe(recipe_json, force_upload=false)` | Upload to the user's account. Quality-gated, with rollback on failure. |

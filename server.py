@@ -270,6 +270,55 @@ async def get_recipe_details(recipe_id: str) -> str:
 
 
 @mcp.tool()
+async def get_custom_recipe(recipe_id: str) -> str:
+    """
+    Fetch one of the user's own custom recipes by ID.
+
+    Complements get_recipe_details (which only works for official Cookidoo
+    content) by reading recipes created via upload_custom_recipe.
+
+    Note: the backend's read endpoint returns a schema.org projection and
+    does not expose `hints`, `cookTime`, or step annotations, even though
+    they are accepted on write. Those show as N/A here.
+    """
+    error, service = await _ensure_connected()
+    if error:
+        return error
+    try:
+        recipe = await service.get_custom_recipe(recipe_id)
+    except Exception as e:
+        return f"Failed to get custom recipe: {e}"
+
+    y = recipe.get("yield") or {}
+    lines = [
+        "Custom Recipe:",
+        "",
+        f"Name: {recipe.get('name', '?')}",
+        f"ID: {recipe.get('id', recipe_id)}",
+        f"Servings: {y.get('value', '?')} {y.get('unitText', '')}".rstrip(),
+        f"Prep Time: {recipe.get('prepTime', 0) // 60} min",
+        f"Total Time: {recipe.get('totalTime', 0) // 60} min",
+        f"Tools: {', '.join(recipe.get('tools') or []) or '?'}",
+        "",
+    ]
+    if recipe.get("ingredients"):
+        lines.append("Ingredients:")
+        for ing in recipe["ingredients"]:
+            lines.append(f"  • {ing}")
+        lines.append("")
+    if recipe.get("instructions"):
+        lines.append("Steps:")
+        for i, step in enumerate(recipe["instructions"], 1):
+            lines.append(f"{i}. {step}")
+        lines.append("")
+    lines.append("Hints: N/A (not exposed by read endpoint)")
+    lines.append("Cook Time: N/A (not exposed by read endpoint)")
+    if recipe.get("url"):
+        lines.append(f"URL: {recipe['url']}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
 async def generate_recipe_structure(
     name: str,
     ingredients: str,
