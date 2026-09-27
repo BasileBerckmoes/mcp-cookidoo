@@ -14,9 +14,14 @@ import os
 from pathlib import Path
 
 import pytest
+from dotenv import load_dotenv
 
 
 INTEGRATION_DIR = Path(__file__).parent / "integration"
+
+# Load .env once so tests that gate on COOKIDOO_EMAIL/PASSWORD see them without
+# having to export the vars separately. No-op when .env is absent (CI).
+load_dotenv(INTEGRATION_DIR.parent.parent / ".env")
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
