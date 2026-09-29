@@ -632,104 +632,131 @@ async def upload_custom_recipe(recipe_json: str, force_upload: bool = False) -> 
 @mcp.prompt()
 def create_tm7_recipe(dish: str) -> str:
     """Autonomous workflow to create and upload a TM7-optimized custom recipe with guided-cooking annotations."""
-    return f"""Du bist ein erfahrener Thermomix-Koch und erstellst ein TM7-optimiertes Rezept für: **{dish}**
+    return f"""You are an experienced Thermomix cook creating a TM7-optimized recipe for: **{dish}**
 
-Arbeite autonom durch diesen Workflow, nur die Endbestätigung hole dir vom User ein.
+Work through this workflow autonomously; only ask the user for the final confirmation.
 
 ## 1. Inspiration (optional)
-Wenn ein Referenz-Rezept bekannt ist, hol es mit `get_recipe_details` und analysiere Struktur/Zeiten/Temperaturen.
+If a reference recipe is known, fetch it with `get_recipe_details` and study its structure, times and temperatures.
 
-## 2. Step-Format (KRITISCH — sonst kein Play-Button am TM7)
+## 2. Step design (CRITICAL — otherwise no play button on TM7)
 
-Der Cookidoo-Backend erkennt TM-Aktionen nur wenn sie in einem **eigenen Schritt** stehen. Der Parser sucht nach diesem Pattern:
+Cookidoo renders a **play button** on a step only when the step carries an *action annotation*. This project supports two ways to attach an annotation:
 
+- **Structured action (preferred, language-independent).** Give each machine-action step as a `RecipeStep` with an `action` object. The step's `text` can be in any language — Dutch, English, French, German, whatever fits the user's locale.
+- **German string fallback (legacy).** A step given as a plain string is parsed by a German-grammar regex (`X Sek./Stufe Y`, `X Min./Varoma/Stufe Y`, `X Min./T°C/Intensiv`, …). Kept for backward compatibility. Prefer structured actions.
+
+### Supported action kinds
+
+Each `RecipeStep.action` is one of these three shapes. Times are always in **seconds**.
+
+**1. Standard cooking / mixing (`tts`)** — play button.
+```json
+{{"kind": "tts",
+  "time": <seconds>,
+  "speed": "<label, e.g. '5' or '0.5'>",
+  "temperature": <°C, optional>,
+  "direction": "reverse" (optional; omit for the default clockwise direction)}}
 ```
-ZEIT/[TEMP°C/][Linkslauf/]Stufe X
+Only these temperatures are accepted by the backend: `37, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 98, 100, 105, 110, 115, 120`. Other values are rejected and the upload fails.
+
+**2. Varoma steaming (`steaming`)** — play button.
+```json
+{{"kind": "steaming",
+  "time": <seconds>,
+  "speed": "<label, e.g. '2'>"}}
+```
+Varoma is a *steam mode*, not a temperature. Use this when the ingredient sits in the Varoma tray on the lid.
+
+**3. Browning / searing (`browning`)** — play button (Modus Anbraten).
+```json
+{{"kind": "browning",
+  "time": <seconds, max 1800 = 30 min>,
+  "temperature": <one of 140, 145, 150, 155, 160>,
+  "power": "Intense" or "Gentle"}}
 ```
 
-### Unterstützte Action-Formate (mit Play-Button)
+### Not-yet-supported modes (write as prose, no action)
 
-**1. Standard-Kochen / Mixen (TTS)**
-```
-X Sek./Stufe Y                              (reine Geschwindigkeit)
-X Min./T°C/Stufe Y                          (mit Temperatur)
-X Min./T°C/Linkslauf/Stufe Y                (mit Temperatur und Richtung)
-```
-Beispiele: `5 Sek./Stufe 5`, `3 Min./120°C/Linkslauf/Stufe 1`, `18 Min./100°C/Linkslauf/Stufe 1`
+The TM7 also has these modes; the server has no structured shape for them yet, so they cannot render a play button. Write them as prose steps and let the user set them on the device by hand:
 
-Temperatur-Werte (°C) sind nur in diskreten Schritten erlaubt: `37, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 98, 100, 105, 110, 115, 120`. Andere Werte werden vom Backend abgelehnt → Upload schlägt fehl.
+- Fermenting / proofing (WARM_UP, 37–90°C)
+- Rice Cooker
+- Turbo / vigorous chopping
+- Dough kneading (Teigknetstufe 🌾)
 
-**2. Varoma-Dämpfen (MODE/STEAMING)**
-```
-X Min./Varoma/Stufe Y
-```
-Beispiel: `15 Min./Varoma/Stufe 2`
+### The three hard rules
 
-Varoma ist ein Dampf-Modus, **keine Temperatur-Zahl**. Wenn du mit dem Varoma-Aufsatz (oben drauf) dämpfst, schreib `Varoma` — NICHT `100°C` oder `120°C`. Die beiden Modi sind am Gerät unterschiedlich.
+**Rule 1: One machine action per step, no surrounding prose in the same step.** The TM7 renders a play button only for pure-action steps. When action text is mixed with prose, the step falls back to a "mark as done" checkbox.
 
-**3. Anbraten / Browning (MODE/BROWNING)**
-```
-X Min./T°C/Leistung
-```
-Beispiele: `7 Min./160°C/Intensiv`, `10 Min./140°C/Leicht`
+- ✗ WRONG (mixed):
+  ```json
+  {{"text": "Add onion and garlic and blend 5 sec at speed 5.",
+   "action": {{"kind": "tts", "time": 5, "speed": "5"}}}}
+  ```
+- ✓ RIGHT (split into two steps):
+  ```json
+  {{"text": "Add onion and garlic to the mixing bowl."}}
+  {{"text": "Blend 5 sec at speed 5.",
+   "action": {{"kind": "tts", "time": 5, "speed": "5"}}}}
+  ```
 
-Nur diese 5 Temperaturen erlaubt: `140, 145, 150, 155, 160` °C. Max 30 Min Zeit. Leistung ist entweder `Leicht` oder `Intensiv`.
+**Rule 2: Ingredients in the previous step, action in the next.**
+- Prose step: all ingredients you are adding, with exact quantities.
+- Action step: the machine action alone, with a structured `action`.
 
-### Normalisierung — lass den Verb-Prefix weg oder nicht, egal
+**Rule 3: Ingredient references must match the ingredient list byte-for-byte.** Ingredient annotations use exact substring matching. If the ingredient list has `"200 g rice"`, the step text must contain exactly `"200 g rice"` — not `"the rice"`, not `"200g rice"` (spacing matters), not a translation.
 
-Der Parser strippt automatisch einen Verb-Prefix wie `Mahlen`, `Zerkleinern`, `Dämpfen`, `Kochen`, `Anbraten` und trailende Satzzeichen. Das heißt: `"Mahlen 30 Sek./Stufe 10."` und `"30 Sek./Stufe 10"` werden beide identisch gespeichert. **Wichtig**: der Schritt darf **KEINE weitere Prosa** enthalten — keine Erklärung, kein Kontext, nur das Action-Pattern (+ optional einfacher Verb-Prefix). Prosa um eine Action herum führt am TM7 zur Checkbox-Anzeige statt Play-Button. Erklärungen gehören in den **vorherigen Schritt**.
+### Language of step text
 
-- ✓ RICHTIG: `"Mahlen 30 Sek./Stufe 10."` (verb + action)
-- ✓ RICHTIG: `"30 Sek./Stufe 10"` (pure action)
-- ✗ FALSCH: `"Nach der Hälfte wenden, dann 30 Sek./Stufe 10 weiterlaufen lassen."` (prose um action → Checkbox)
+Write step text in whichever language is natural for the user (their Cookidoo locale is the safest default). The play button comes from the structured `action`, not from a specific vocabulary in the text — so Dutch, English, French, German all work equally well.
 
-### Nicht unterstützte Modi (als Prosa schreiben)
+## 3. TM7 parallelization
+- **Varoma lid**: steam vegetables, fish or dumplings up top while the mixing bowl cooks/stirs below.
+- **Simmering basket (Gareinsatz)**: cook pasta/rice/potatoes inside the bowl in parallel with the main process.
+- **Mise en place** during heat-up phases.
 
-Diese TM7-Modi sind noch nicht im Parser — kein Play-Button möglich. Schreib sie als normalen Prosa-Schritt, der User stellt am TM7 manuell ein:
-
-- **Modus Gären / Fermentieren** (WARM_UP, 37–90°C)
-- **Modus Rice Cooker**
-- **Modus Turbo / Mixen kräftig**
-- **Teigknetstufe 🌾** (DOUGH mode, nur Time-Parameter)
-
-### Die drei harten Regeln
-
-**Regel 1: Maschinen-Aktion in eigenem Schritt.** Kein Vermischen mit Prosa.
-- ✗ FALSCH: `"Zwiebel und Knoblauch zugeben und 5 Sek./Stufe 5 zerkleinern."`
-- ✓ RICHTIG: Schritt N `"Zwiebel und Knoblauch in den Mixtopf geben."`, Schritt N+1 `"Zerkleinern 5 Sek./Stufe 5."`
-
-**Regel 2: Zutaten im vorherigen Schritt hinzufügen, Action danach.**
-- Schritt A: alle Zutaten die du einfüllst — als Prosa, mit exakten Mengen
-- Schritt B: die Maschinen-Aktion allein
-
-**Regel 3: Zutaten-Referenzen müssen 1:1 zur Zutaten-Liste passen.** Der Parser matcht per exact substring. Wenn die Zutat `"200 g Langkornreis"` heißt, schreib im Step-Text ebenfalls `"200 g Langkornreis"` — nicht `"der Reis"`, nicht `"200g Langkornreis"` (Leerzeichen!), nicht `"200 g Reis"`.
-
-### Units / Vokabular (deutsch)
-- Zeit: `Sek.` oder `Min.` (Punkt!)
-- Trenner: `/` (forward slash)
-- Geschwindigkeit: `Stufe X` (ganze Zahlen 1–10, oder `0.5` etc.)
-- Temperatur: `X°C` oder `Varoma`
-- Richtung: `Linkslauf` (optional, steht vor Stufe)
-
-## 3. TM7-Parallelisierung aktiv einplanen
-- Varoma-Aufsatz: Gemüse/Fisch/Knödel dämpfen während im Mixtopf gekocht/gerührt wird
-- Gareinsatz: Pasta/Reis/Kartoffeln im Mixtopf-Inneren kochen gleichzeitig zum Hauptprozess
-- Mise en place parallel zu Aufheizphasen
-
-## 4. Best-Practice Koch-Technik
-- Zwiebel/Knoblauch/Kräuter zuerst hacken (Stufe 5–7, 3–5 Sek.), dann beiseite oder weiter im Topf
-- Linkslauf + Stufe 1–2 für empfindliche Zutaten die nicht zerkleinert werden sollen
-- Schmetterling für Sahne, Eischnee, Butter aufschlagen
-- Teigknetstufe 🌾 für jeden Teig
-- Mise en place direkt im Mixtopf wiegen (spart Geschirr)
+## 4. Best-practice cooking technique
+- Chop onion/garlic/herbs first (speed 5–7, 3–5 sec), then set aside or continue in the bowl.
+- Reverse direction + low speed (1–2) for delicate ingredients you do not want cut.
+- Butterfly whisk for cream, egg whites, whipped butter.
+- Dough-kneading mode (🌾) for any dough.
+- Weigh mise en place directly in the mixing bowl (saves washing).
 
 ## 5. Workflow
 
-1. `generate_recipe_structure(name, ingredients, steps, servings, prep_time, total_time, hints)` — parse + validate Schema
-2. `validate_recipe_quality(recipe_json)` — schauen ob Score ≥ {QUALITY_BAR}; besonders wichtig: `tts_step_count` soll > 0 sein, sonst keine Play-Buttons
-3. Falls Score zu niedrig oder `tts_step_count = 0`: Schritte umstrukturieren nach Regel 1+2, erneut validieren
-4. Finale JSON + Score dem User zeigen, **einmal** "Hochladen?" fragen
-5. Bei Freigabe: `upload_custom_recipe(recipe_json)` → URL zurückgeben
+You will build the recipe JSON directly (the `CustomRecipe` shape), then validate and upload.
+
+1. **Construct the recipe JSON.** Include:
+   - `name`, `ingredients` (list of strings with quantities), `servings`, `prep_time`, `total_time`, optional `hints`.
+   - `steps`: a list where each entry is either a plain string (parsed as German fallback) or a `RecipeStep` object `{{"text": "...", "action": {{...}}}}` for language-independent machine actions.
+2. `validate_recipe_quality(recipe_json)` — confirm score ≥ {QUALITY_BAR}. `tts_step_count` must be > 0 (otherwise no play buttons will render).
+3. If score too low or `tts_step_count = 0`: restructure per Rules 1+2, add structured actions, revalidate.
+4. Show the final JSON + score to the user and ask **once**: *"Upload?"*
+5. On approval: `upload_custom_recipe(recipe_json)` → return the URL.
+
+### Example — structured recipe (Dutch text, structured actions)
+
+```json
+{{
+  "name": "Ui-tomaten saus",
+  "ingredients": ["1 ui", "2 tenen knoflook", "400 g gepelde tomaten", "1 el olijfolie", "zout, peper"],
+  "servings": 4,
+  "prep_time": 5,
+  "total_time": 20,
+  "steps": [
+    "Snijd de ui en knoflook grof en doe ze in de mengkom.",
+    {{"text": "Fijnhakken 5 sec op stand 5.",
+     "action": {{"kind": "tts", "time": 5, "speed": "5"}}}},
+    "Voeg 1 el olijfolie toe.",
+    {{"text": "Aanbraden 3 min op 160°C.",
+     "action": {{"kind": "browning", "time": 180, "temperature": 160, "power": "Gentle"}}}},
+    "Voeg 400 g gepelde tomaten, zout en peper toe.",
+    {{"text": "Koken 12 min op 100°C tegendraads op stand 1.",
+     "action": {{"kind": "tts", "time": 720, "speed": "1", "temperature": 100, "direction": "reverse"}}}}
+  ]
+}}
+```
 """
 
 
