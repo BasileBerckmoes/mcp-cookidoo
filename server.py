@@ -80,9 +80,21 @@ _ACCESSORY_RE = re.compile(
     re.IGNORECASE,
 )
 _PARALLEL_RE = re.compile(
-    r"(gleichzeitig|parallel|während.*kocht|varoma.*aufsatz|varoma.*einsatz|während.*gart|meanwhile|while.*cook)",
+    r"(gleichzeitig|parallel|während.*kocht|während.*gart|meanwhile|while.*cook|ondertussen)",
     re.IGNORECASE,
 )
+
+
+def _parallel_bonus_modes() -> frozenset[str]:
+    """Which extra parallel-work bonus components are enabled.
+
+    Phrase-based +10 is always on. Additional components are opt-in via a
+    comma-separated ``COOKIDOO_PARALLEL_BONUS`` env var; today only ``varoma``
+    is recognised, which re-adds the +10 for a ``SteamingAction`` or "varoma"
+    text (the pre-#5 default). Read at call time so tests can monkeypatch.
+    """
+    raw = os.environ.get("COOKIDOO_PARALLEL_BONUS", "")
+    return frozenset(m.strip().lower() for m in raw.split(",") if m.strip())
 
 
 def _score_recipe(recipe: CustomRecipe) -> dict:
@@ -143,57 +155,64 @@ def _score_recipe(recipe: CustomRecipe) -> dict:
     tts_points = round(tts_ratio * 50)
     if tts_step_count == 0:
         issues.append(
-            "Kein Schritt hat eine parseable TTS-Aktion. Formuliere Maschinen-Aktionen "
-            "in einem eigenen Schritt, z.B. 'Zerkleinern 5 Sek./Stufe 5.' oder "
-            "'Kochen 18 Min./100°C/Linkslauf/Stufe 1.' — nur diese werden mit "
-            "Play-Button am TM7 als guided step angezeigt."
+            "No step has a parseable machine action. Machine actions render with a "
+            "play button on the TM7. Either write the step as a structured RecipeStep "
+            "with an `action` field (language-independent, e.g. "
+            "`{\"text\": \"Mix 5 sec at speed 5.\", \"action\": {\"kind\": \"tts\", \"time\": 5, \"speed\": \"5\"}}`) "
+            "or as a plain-string step in German (`Zerkleinern 5 Sek./Stufe 5.`) "
+            "which the fallback parser recognises."
         )
     elif tts_ratio < 0.5:
         issues.append(
-            f"Nur {tts_step_count} von ~{expected_actions} erwarteten Aktionsschritten "
-            "sind TTS-parseable. Weitere Aktionen im Format 'Zeit/[Temp°C/][Linkslauf/]Stufe X' "
-            "in eigenen Schritten ergänzen."
+            f"Only {tts_step_count} of ~{expected_actions} expected action steps have "
+            "a parseable action. Add more actions via the structured `action` field "
+            "(any language) or the German fallback format (`5 Sek./Stufe 5`)."
         )
 
     # Points 2: ingredient references resolved via annotations (20 pts)
     ing_points = 20 if ingredient_hit_steps >= 1 else 0
     if ingredient_hit_steps == 0 and ingredients:
         issues.append(
-            "Keine Zutat wird im Schritt-Text exakt referenziert. Verwende die "
-            "Zutaten-Einträge 1:1 im Text (z.B. '200 g Langkornreis in den Mixtopf geben.')"
-            " damit sie als INGREDIENT-Annotation verlinkt werden."
+            "No ingredient is referenced verbatim in a step. Repeat ingredient entries "
+            "(e.g. `200 g rice`) in the step text so they get linked as INGREDIENT "
+            "annotations."
         )
 
     # Points 3: accessories mentioned (10 pts)
     accessory_points = 10 if has_accessory else 0
     if not has_accessory:
         suggestions.append(
-            "Erwäge Zubehör zu nennen: Schmetterling, Spatel, Varoma-Aufsatz, Gareinsatz."
+            "Consider naming an accessory: butterfly whisk, spatula, Varoma steamer, "
+            "or simmering basket."
         )
 
-    # Points 4: TM7 parallelization (20 pts — Varoma/Gareinsatz)
+    # Points 4: parallel work bonus (up to 20 pts).
+    # Phrase-based +10 always credits ("meanwhile", "ondertussen", "gleichzeitig", …).
+    # Varoma-based +10 is opt-in via COOKIDOO_PARALLEL_BONUS=varoma so recipes are
+    # not nudged toward the Varoma by default.
+    bonus_modes = _parallel_bonus_modes()
     parallel_points = 0
     if has_parallel:
         parallel_points += 10
-    if has_varoma:
+    if has_varoma and "varoma" in bonus_modes:
         parallel_points += 10
     parallel_points = min(20, parallel_points)
-    if parallel_points < 20:
+    if not has_parallel:
         suggestions.append(
-            "TM7-Parallelisierung: prüfe ob Varoma-Aufsatz (Dämpfen oben) oder "
-            "Gareinsatz (Pasta/Reis im Mixtopf) parallel zum Haupt-Kochen genutzt werden "
-            "kann — spart Zeit und ist TM7 best practice."
+            "Consider signalling parallel work with phrasing like `meanwhile`, "
+            "`ondertussen`, or `gleichzeitig` when a step continues off-device while "
+            "the TM7 runs — it earns the parallel-work bonus."
         )
 
     score = tts_points + ing_points + accessory_points + parallel_points
 
     text_all = " ".join(step_texts).lower()
-    if ("sahne" in text_all or "eiweiß" in text_all or "eischnee" in text_all or "cream" in text_all) and not has_butterfly:
-        suggestions.append("Bei Sahne/Eischnee: Schmetterling einsetzen.")
+    if ("sahne" in text_all or "eiweiß" in text_all or "eischnee" in text_all or "cream" in text_all or "egg white" in text_all) and not has_butterfly:
+        suggestions.append("For cream or egg whites: use the butterfly whisk.")
     if ("teig" in text_all or "dough" in text_all) and not re.search(
         r"teigknetstufe|kneading", text_all, re.IGNORECASE
     ):
-        suggestions.append("Bei Teig: Teigknetstufe (🌾) verwenden.")
+        suggestions.append("For dough: use the kneading mode (🌾).")
 
     meets_bar = score >= QUALITY_BAR
 

@@ -83,9 +83,9 @@ Score out of 100. Default upload threshold is 70, configurable via `COOKIDOO_QUA
 | TTS/MODE-parseable action steps (Play-Button) | 50 | Roughly half of steps should be pure actions like `5 Sek./Stufe 5` or `15 Min./Varoma/Stufe 2`. Scales linearly with coverage. |
 | Ingredient annotations resolved in step text | 20 | At least one step should reference an ingredient using the exact substring from the ingredient list, so the backend can link them. |
 | Accessory mentions (Schmetterling, Varoma, Spatel, Gareinsatz, …) | 10 | Helps the cook know what to attach. |
-| TM7 parallelization (Varoma above, Gareinsatz inside, "gleichzeitig"/"während") | 20 | Encourages using the TM7's two cooking zones at once. |
+| Parallel work (phrase-based +10, Varoma +10 opt-in) | 20 | Phrases like `meanwhile` / `ondertussen` / `gleichzeitig` always earn +10; the Varoma-based +10 is opt-in via `COOKIDOO_PARALLEL_BONUS=varoma` (see Configuration). |
 
-The validator also produces contextual suggestions, e.g. Schmetterling for cream/egg whites, Teigknetstufe for dough.
+The validator also produces contextual suggestions in English, e.g. butterfly whisk for cream/egg whites, kneading mode for dough.
 
 The stylistic criteria together max out at 50 points, so the default bar of 70 cannot be met without a substantial share of parseable guided actions — the one criterion that is functional rather than cosmetic.
 
@@ -113,6 +113,7 @@ All settings via environment variables (or `.env` file):
 | `COOKIDOO_MCP_PORT` | `8001` | Local bind port (HTTP mode only) |
 | `COOKIDOO_API_TOKEN` | empty | Bearer token required on `/mcp`. Empty = no middleware auth. |
 | `COOKIDOO_QUALITY_BAR` | `70` | Minimum quality score required by `upload_custom_recipe` |
+| `COOKIDOO_PARALLEL_BONUS` | empty | Comma-separated set of opt-in parallel-work bonus components. Phrase-based +10 (`meanwhile` / `ondertussen` / `gleichzeitig`) always applies; set to `varoma` to additionally credit +10 for a `SteamingAction` or "varoma" in step text. Empty by default so recipes are not nudged toward the Varoma. |
 | `COOKIDOO_INSECURE_SSL` | off | Set to `1` to disable TLS verification (debugging behind intercepting proxies only) |
 
 ## HTTP Transport
@@ -142,7 +143,7 @@ For production deployment behind a reverse proxy (Caddy/nginx/Traefik), terminat
 
 - **Single account.** The authenticated session is a module-level singleton, so one running instance serves exactly one Cookidoo account.
 - **Undocumented API.** The created-recipes endpoint and its annotation schema were reverse-engineered from the web app and can change without warning.
-- **German vocabulary first (for the fallback path).** When steps are supplied as plain strings, the regex parser expects German tokens (`Sek.`, `Min.`, `Stufe`, `Varoma`, `Intensiv`, …) with partial English/French support. The scorer's accessory / parallelisation heuristics are also written for `de-CH`. Use the structured-action path (`RecipeStep.action`) to write step text in any language without depending on the parser.
+- **German vocabulary first (for the fallback path).** When steps are supplied as plain strings, the regex parser expects German tokens (`Sek.`, `Min.`, `Stufe`, `Varoma`, `Intensiv`, …) with partial English/French support. The scorer's accessory heuristic is also German-heavy. Validator messages are English, and parallel-work phrasing is recognised in DE + NL + EN (`gleichzeitig` / `ondertussen` / `meanwhile`). Use the structured-action path (`RecipeStep.action`) to write step text in any language without depending on the parser.
 - **Not all TM7 modes are covered.** Gären/Fermentieren, Rice Cooker, Turbo and Teigknetstufe have no annotation support yet; the prompt instructs the model to write them as prose so the user sets them manually on the device.
 - **Shopping list ingredients land under "Sonstige" (Misc).** When a custom recipe is added to the Cookidoo shopping list, every ingredient is categorized as `ShoppingCategory-rpf-10` (Sonstige), regardless of what it is. This is a Cookidoo backend behaviour, not an MCP limitation: the public custom-recipe API accepts ingredients only as free-text strings, the Cookidoo web editor itself has no per-ingredient category picker or canonical-ingredient autocomplete, and the backend hardcodes the `rpf-10` reference for every customer-recipe ingredient. Categorization on the shopping list works for native Cookidoo recipes because those carry a canonical `ingredient_ref` that maps to a category server-side. There is currently no known workaround.
 
