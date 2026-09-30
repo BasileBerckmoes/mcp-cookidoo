@@ -250,6 +250,74 @@ def build_instruction(text: str, ingredients: list[str]) -> dict:
     }
 
 
+def _annotations_from_action(text: str, action, ingredients: list[str]) -> list[dict]:
+    """Build Cookidoo annotations from a structured action.
+
+    The action carries the numeric/enum values directly, so no text parsing is
+    needed — the step text can be in any language. The annotation spans the
+    full step text (offset=0, length=len(text)); callers keep step text short
+    and action-only, per the "one action per step" rule.
+
+    ``action`` is duck-typed as anything with the fields on
+    :class:`schemas.TTSAction` / :class:`schemas.SteamingAction` /
+    :class:`schemas.BrowningAction`, discriminated by ``action.kind``.
+    """
+    span = {"offset": 0, "length": len(text)}
+    if action.kind == "tts":
+        data: dict = {"speed": action.speed, "time": action.time}
+        if getattr(action, "temperature", None) is not None:
+            data["temperature"] = {"value": str(action.temperature), "unit": "C"}
+        return [{"type": "TTS", "data": data, "position": dict(span)}]
+    if action.kind == "steaming":
+        return [
+            {
+                "type": "MODE",
+                "name": "STEAMING",
+                "data": {
+                    "time": action.time,
+                    "speed": action.speed,
+                    "direction": "CW",
+                    "accessory": "Varoma",
+                },
+                "position": dict(span),
+            }
+        ]
+    if action.kind == "browning":
+        return [
+            {
+                "type": "MODE",
+                "name": "BROWNING",
+                "data": {
+                    "time": action.time,
+                    "temperature": {"value": str(action.temperature), "unit": "C"},
+                    "power": action.power,
+                },
+                "position": dict(span),
+            }
+        ]
+    raise ValueError(f"Unknown action kind: {action.kind!r}")
+
+
+def _step_to_instruction(step, ingredients: list[str]) -> dict:
+    """Convert one step into a Cookidoo instruction dict.
+
+    Accepts either a plain string (legacy — parses German text via
+    :func:`build_step_annotations`) or a :class:`schemas.RecipeStep`-like
+    object with ``.text`` and ``.action``. When ``action`` is present the
+    annotation is built directly from it (language-independent); when absent
+    or when the step is a bare string, the parser fallback runs.
+    """
+    if isinstance(step, str):
+        return build_instruction(normalize_action_step(step), ingredients)
+    if getattr(step, "action", None) is not None:
+        return {
+            "type": "STEP",
+            "text": step.text,
+            "annotations": _annotations_from_action(step.text, step.action, ingredients),
+        }
+    return build_instruction(normalize_action_step(step.text), ingredients)
+
+
 def _build_recipe_payload(
     *,
     name: str,
@@ -283,10 +351,7 @@ def _build_recipe_payload(
         "cookTime": cook_time_seconds,
         "totalTime": total_time_seconds,
         "ingredients": [{"type": "INGREDIENT", "text": ing} for ing in ingredients],
-        "instructions": [
-            build_instruction(normalize_action_step(step), ingredients)
-            for step in steps
-        ],
+        "instructions": [_step_to_instruction(step, ingredients) for step in steps],
         "hints": "\n".join(hints) if hints and isinstance(hints, list) else (hints if hints else ""),
         "workStatus": "PRIVATE",
         "recipeMetadata": {"requiresAnnotationsCheck": False},

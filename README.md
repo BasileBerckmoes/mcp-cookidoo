@@ -43,15 +43,17 @@ Let Claude read recipes from your Cookidoo account and create new TM7-optimized 
 ## What it does
 
 - **Read recipes.** Fetch any Cookidoo recipe by ID (e.g. `r59322`) including ingredients, steps, timings, and metadata.
-- **Create TM7-optimized custom recipes.** Action steps are parsed and rewritten into the three guided-cooking annotation families:
-  - **TTS** (standard): `30 Sek./Stufe 5`
-  - **MODE/STEAMING** (Varoma): auto-detects the word "Varoma" and emits the correct accessory shape
-  - **MODE/BROWNING** (Anbraten): `5 Min./150°C/Intensiv`
-  
-  These render as proper guided steps with a Play-Button on the TM7 device. Verb prefixes like *Mahlen*, *Zerkleinern*, *Anbraten* are auto-stripped, since pure-action steps render as guided steps while verb-prefixed prose renders as "mark as done" checkboxes.
-- **Quality gate.** Recipes are scored 0–100 on Thermomix vocabulary coverage before upload. Below the configured bar, upload is refused unless `force_upload=true`.
+- **Create TM7-optimized custom recipes.** Action steps become one of the three guided-cooking annotation families and render with a Play-Button on the TM7:
+  - **TTS** (standard cook / mix)
+  - **MODE/STEAMING** (Varoma steaming)
+  - **MODE/BROWNING** (Anbraten)
+
+  A step can declare its action in either of two ways:
+  - **Structured action (preferred, language-independent).** The step is a JSON object with a `text` in any language and an `action` object carrying the raw numbers (e.g. `{"kind":"tts","time":5,"speed":"5"}`). The server hands those values straight to Cookidoo; the step text can be Dutch, English, French, German, anything.
+  - **German text fallback.** A step given as a plain string is parsed by a German-grammar regex (`5 Sek./Stufe 5`, `15 Min./Varoma/Stufe 2`, `7 Min./160°C/Intensiv`). Kept for backward compatibility; new integrations should use structured actions.
+- **Quality gate.** Recipes are scored 0–100 on structured-action / German-parseable coverage before upload. Below the configured bar, upload is refused unless `force_upload=true`.
 - **Automatic rollback.** If the upload PATCH fails (e.g. schema validation error), the partial recipe is deleted so no zombies accumulate in your account.
-- **Guided workflow prompt.** The MCP prompt `create_tm7_recipe(dish)` carries the full reverse-engineered step grammar — supported action formats, allowed discrete temperature values, and the structuring rules — so the model learns the constraints before writing a single step.
+- **Guided workflow prompt.** The MCP prompt `create_tm7_recipe(dish)` teaches the model the structured action shape (kinds, allowed temperature values, the "one action per step" rule) so the model learns the constraints before writing a single step.
 
 ## MCP Tools
 
@@ -140,7 +142,7 @@ For production deployment behind a reverse proxy (Caddy/nginx/Traefik), terminat
 
 - **Single account.** The authenticated session is a module-level singleton, so one running instance serves exactly one Cookidoo account.
 - **Undocumented API.** The created-recipes endpoint and its annotation schema were reverse-engineered from the web app and can change without warning.
-- **German vocabulary first.** The parser accepts some English and French tokens, but the scorer's heuristics and the MCP prompt are written for `de-CH`.
+- **German vocabulary first (for the fallback path).** When steps are supplied as plain strings, the regex parser expects German tokens (`Sek.`, `Min.`, `Stufe`, `Varoma`, `Intensiv`, …) with partial English/French support. The scorer's accessory / parallelisation heuristics are also written for `de-CH`. Use the structured-action path (`RecipeStep.action`) to write step text in any language without depending on the parser.
 - **Not all TM7 modes are covered.** Gären/Fermentieren, Rice Cooker, Turbo and Teigknetstufe have no annotation support yet; the prompt instructs the model to write them as prose so the user sets them manually on the device.
 - **Shopping list ingredients land under "Sonstige" (Misc).** When a custom recipe is added to the Cookidoo shopping list, every ingredient is categorized as `ShoppingCategory-rpf-10` (Sonstige), regardless of what it is. This is a Cookidoo backend behaviour, not an MCP limitation: the public custom-recipe API accepts ingredients only as free-text strings, the Cookidoo web editor itself has no per-ingredient category picker or canonical-ingredient autocomplete, and the backend hardcodes the `rpf-10` reference for every customer-recipe ingredient. Categorization on the shopping list works for native Cookidoo recipes because those carry a canonical `ingredient_ref` that maps to a category server-side. There is currently no known workaround.
 
