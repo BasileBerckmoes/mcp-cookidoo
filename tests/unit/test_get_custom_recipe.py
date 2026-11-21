@@ -62,7 +62,12 @@ async def test_returns_full_dict_shape() -> None:
         "id": "01ABC",
         "name": "my recipe",
         "ingredients": ["100 g water", "5 g salt"],
+        "steps": [
+            {"text": "Water and salt into the mixing bowl.", "action": None},
+            {"text": "3 Min./100°C/Stufe 1", "action": None},
+        ],
         "instructions": ["Water and salt into the mixing bowl.", "3 Min./100°C/Stufe 1"],
+        "annotations_returned": False,
         "yield": {"value": 2, "unitText": "portion"},
         "prepTime": 60,
         "cookTime": None,
@@ -74,10 +79,8 @@ async def test_returns_full_dict_shape() -> None:
     }
 
 
-async def test_hints_and_cook_time_are_none() -> None:
-    """Guard: even if the library grows a `hints`/`cook_time` field later, our
-    service explicitly returns them as None until we probe an endpoint that
-    exposes them. See finding 2026-09-27-custom-recipe-read-schema.md."""
+async def test_hints_none_when_library_has_none_and_cook_time_always_none() -> None:
+    """cookidoo-api < 0.19 has no ``hints`` attribute; cookTime is never read."""
     fake = _fake_recipe()
 
     class FakeApi:
@@ -87,6 +90,17 @@ async def test_hints_and_cook_time_are_none() -> None:
     result = await _service_with_fake_api(FakeApi()).get_custom_recipe("01ABC")
     assert result["hints"] is None
     assert result["cookTime"] is None
+
+
+async def test_hints_pass_through_when_returned() -> None:
+    fake = _fake_recipe(hints=["Keeps 4 days in the fridge.", "Freeze max 2 portions."])
+
+    class FakeApi:
+        async def get_custom_recipe(self, recipe_id: str) -> Any:
+            return fake
+
+    result = await _service_with_fake_api(FakeApi()).get_custom_recipe("01ABC")
+    assert result["hints"] == ["Keeps 4 days in the fridge.", "Freeze max 2 portions."]
 
 
 async def test_retries_once_on_auth_exception() -> None:

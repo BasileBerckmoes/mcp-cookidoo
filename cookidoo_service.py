@@ -249,8 +249,26 @@ def build_instruction(text: str, ingredients: list[str]) -> dict:
     return {
         "type": "STEP",
         "text": text,
-        "annotations": build_step_annotations(text, ingredients),
+        "annotations": _to_utf16_positions(text, build_step_annotations(text, ingredients)),
     }
+
+
+def _temperature_json(value) -> dict:
+    """Serialize a temperature the way Cookidoo stores it.
+
+    Numeric °C → ``{"value": "100", "unit": "C"}``; Varoma → ``{"value": "varoma"}``
+    (no unit), matching cookidoo-api's ``_temperature_to_json``.
+    """
+    if isinstance(value, str) and value.lower() == "varoma":
+        return {"value": "varoma"}
+    return {"value": str(value), "unit": "C"}
+
+
+def _direction_json(action) -> str:
+    return "CCW" if getattr(action, "direction", None) == "reverse" else "CW"
+
+
+_OTHER_MODES = ("dough", "turbo", "blend", "warm_up", "rice_cooker")
 
 
 def _annotations_from_action(text: str, action, ingredients: list[str]) -> list[dict]:
@@ -259,17 +277,17 @@ def _annotations_from_action(text: str, action, ingredients: list[str]) -> list[
     The action carries the numeric/enum values directly, so no text parsing is
     needed — the step text can be in any language. The annotation spans the
     full step text (offset=0, length=len(text)); callers keep step text short
-    and action-only, per the "one action per step" rule.
+    and action-only, per the "one action per step" rule. Positions here are
+    Python indices; :func:`_to_utf16_positions` converts them for the wire.
 
-    ``action`` is duck-typed as anything with the fields on
-    :class:`schemas.TTSAction` / :class:`schemas.SteamingAction` /
-    :class:`schemas.BrowningAction`, discriminated by ``action.kind``.
+    ``action`` is duck-typed as anything with the fields on the
+    :mod:`schemas` action models, discriminated by ``action.kind``.
     """
     span = {"offset": 0, "length": len(text)}
     if action.kind == "tts":
         data: dict = {"speed": action.speed, "time": action.time}
         if getattr(action, "temperature", None) is not None:
-            data["temperature"] = {"value": str(action.temperature), "unit": "C"}
+            data["temperature"] = _temperature_json(action.temperature)
         if getattr(action, "direction", None) == "reverse":
             # Cookidoo wire value for reverse rotation (Linkslauf); clockwise
             # is the default and is omitted, matching official recipes.
@@ -283,8 +301,8 @@ def _annotations_from_action(text: str, action, ingredients: list[str]) -> list[
                 "data": {
                     "time": action.time,
                     "speed": action.speed,
-                    "direction": "CW",
-                    "accessory": "Varoma",
+                    "direction": _direction_json(action),
+                    "accessory": getattr(action, "accessory", None) or "Varoma",
                 },
                 "position": dict(span),
             }
@@ -296,13 +314,142 @@ def _annotations_from_action(text: str, action, ingredients: list[str]) -> list[
                 "name": "BROWNING",
                 "data": {
                     "time": action.time,
-                    "temperature": {"value": str(action.temperature), "unit": "C"},
+                    "temperature": _temperature_json(action.temperature),
                     "power": action.power,
                 },
                 "position": dict(span),
             }
         ]
+    if action.kind in _OTHER_MODES:
+        data = {}
+        if getattr(action, "time", None) is not None:
+            data["time"] = action.time
+        if getattr(action, "temperature", None) is not None:
+            data["temperature"] = _temperature_json(action.temperature)
+        if getattr(action, "speed", None) is not None:
+            data["speed"] = action.speed
+        if getattr(action, "direction", None) == "reverse":
+            data["direction"] = "CCW"
+        return [
+            {
+                "type": "MODE",
+                "name": action.kind.upper(),
+                "data": data,
+                "position": dict(span),
+            }
+        ]
     raise ValueError(f"Unknown action kind: {action.kind!r}")
+
+
+def _utf16_len(s: str) -> int:
+    return len(s.encode("utf-16-le")) // 2
+
+
+def _to_utf16_positions(text: str, annotations: list[dict]) -> list[dict]:
+    """Convert annotation positions from Python indices to UTF-16 code units.
+
+    Cookidoo (a JavaScript backend) counts offsets/lengths in UTF-16 code
+    units. Python indexes by code point, so any astral character (emoji) before
+    or inside a span shifts it. Pure-BMP text is unchanged.
+    """
+    if _utf16_len(text) == len(text):
+        return annotations
+    out = []
+    for a in annotations:
+        pos = a.get("position")
+        if not pos:
+            out.append(a)
+            continue
+        off, ln = pos["offset"], pos["length"]
+        b = dict(a)
+        b["position"] = {
+            "offset": _utf16_len(text[:off]),
+            "length": _utf16_len(text[off:off + ln]),
+        }
+        out.append(b)
+    return out
+
+
+def _temp_from_annotation(temperature) -> object:
+    """cookidoo-api CookidooTemperatureSetting → schema temperature (int or 'varoma')."""
+    if temperature is None:
+        return None
+    value = getattr(temperature, "value", temperature)
+    value = getattr(value, "value", value)  # StrEnum
+    if str(value).lower() == "varoma":
+        return "varoma"
+    try:
+        return int(str(value))
+    except ValueError:
+        return str(value)
+
+
+def _enum(v):
+    return getattr(v, "value", v)
+
+
+def action_from_annotation(ann) -> Optional[dict]:
+    """Map a parsed cookidoo-api annotation back to a schema action dict.
+
+    Inverse of :func:`_annotations_from_action`, so a recipe read with
+    ``get_custom_recipe`` can be fed straight back into ``update_custom_recipe``
+    without losing play buttons. Ingredient annotations return ``None``: they
+    are re-derived from the step text on every write.
+    """
+    cls = type(ann).__name__
+    if cls == "CookidooTTSAnnotation":
+        action: dict = {"kind": "tts", "time": ann.time, "speed": _enum(ann.speed)}
+        temp = _temp_from_annotation(ann.temperature)
+        if temp is not None:
+            action["temperature"] = temp
+        if _enum(ann.direction) == "CCW":
+            action["direction"] = "reverse"
+        return action
+    if cls == "CookidooModeAnnotation":
+        mode = str(_enum(ann.mode) or ann.name or "").lower()
+        if mode == "steaming":
+            action = {
+                "kind": "steaming",
+                "time": ann.time,
+                "speed": _enum(ann.speed),
+                "accessory": _enum(ann.accessory) or "Varoma",
+            }
+        elif mode == "browning":
+            action = {
+                "kind": "browning",
+                "time": ann.time,
+                "temperature": _temp_from_annotation(ann.temperature),
+                "power": _enum(ann.power),
+            }
+            return action
+        else:
+            action = {"kind": mode}
+            if ann.time is not None:
+                action["time"] = ann.time
+            temp = _temp_from_annotation(ann.temperature)
+            if temp is not None:
+                action["temperature"] = temp
+            if ann.speed is not None:
+                action["speed"] = _enum(ann.speed)
+        if _enum(ann.direction) == "CCW":
+            action["direction"] = "reverse"
+        return action
+    return None
+
+
+def step_from_instruction(instr) -> dict:
+    """cookidoo-api instruction (str or CookidooInstruction) → schema step dict."""
+    if isinstance(instr, str):
+        return {"text": instr, "action": None}
+    text = getattr(instr, "text", str(instr))
+    actions = [
+        a for a in (action_from_annotation(x) for x in getattr(instr, "annotations", []) or [])
+        if a is not None
+    ]
+    step: dict = {"text": text, "action": actions[0] if actions else None}
+    if len(actions) > 1:
+        step["extra_actions"] = actions[1:]  # schema allows one; surface the rest
+    return step
 
 
 def _step_to_instruction(step, ingredients: list[str]) -> dict:
@@ -320,7 +467,9 @@ def _step_to_instruction(step, ingredients: list[str]) -> dict:
         return {
             "type": "STEP",
             "text": step.text,
-            "annotations": _annotations_from_action(step.text, step.action, ingredients),
+            "annotations": _to_utf16_positions(
+                step.text, _annotations_from_action(step.text, step.action, ingredients)
+            ),
         }
     return build_instruction(normalize_action_step(step.text), ingredients)
 
@@ -362,6 +511,36 @@ def _build_recipe_payload(
         "hints": "\n".join(hints) if hints and isinstance(hints, list) else (hints if hints else ""),
         "workStatus": "PRIVATE",
         "recipeMetadata": {"requiresAnnotationsCheck": False},
+    }
+
+
+def _custom_recipe_to_dict(recipe) -> dict:
+    """Project a cookidoo-api ``CookidooCustomRecipe`` into a read dict.
+
+    ``steps`` uses the same shape as :class:`schemas.RecipeStep`, so it can be
+    sent back through ``update_custom_recipe``. ``hints`` and step annotations
+    are only populated when cookidoo-api parses them (>= 0.19) *and* the
+    backend returns them; ``annotations_returned`` says whether any step came
+    back with a machine action.
+    """
+    instructions = list(recipe.instructions)
+    steps = [step_from_instruction(i) for i in instructions]
+    hints = getattr(recipe, "hints", None)
+    return {
+        "id": recipe.id,
+        "name": recipe.name,
+        "ingredients": list(recipe.ingredients),
+        "steps": steps,
+        "instructions": [st["text"] for st in steps],
+        "annotations_returned": any(st["action"] for st in steps),
+        "yield": {"value": recipe.serving_size, "unitText": getattr(recipe, "unit_text", "portion")},
+        "prepTime": recipe.active_time,
+        "cookTime": None,
+        "totalTime": recipe.total_time,
+        "tools": list(recipe.tools),
+        "hints": list(hints) if hints else None,
+        "image": recipe.image,
+        "url": recipe.url,
     }
 
 
@@ -600,20 +779,23 @@ class CookidooService:
             await self._api_client.refresh_token()
             recipe = await self._api_client.get_custom_recipe(recipe_id)
 
-        return {
-            "id": recipe.id,
-            "name": recipe.name,
-            "ingredients": list(recipe.ingredients),
-            "instructions": list(recipe.instructions),
-            "yield": {"value": recipe.serving_size, "unitText": "portion"},
-            "prepTime": recipe.active_time,
-            "cookTime": None,
-            "totalTime": recipe.total_time,
-            "tools": list(recipe.tools),
-            "hints": None,
-            "image": recipe.image,
-            "url": recipe.url,
-        }
+        return _custom_recipe_to_dict(recipe)
+
+    async def copy_official_recipe(self, recipe_id: str, servings: int) -> dict:
+        """Copy an official Cookidoo recipe into the user's custom recipes.
+
+        Uses the backend's native copy (``add_custom_recipe_from``), so the
+        copy keeps Cookidoo's own annotations — play buttons included —
+        rather than a rebuild from text.
+        """
+        if not self._api_client:
+            raise Exception("Not authenticated. Please call login() first.")
+        try:
+            recipe = await self._api_client.add_custom_recipe_from(recipe_id, servings)
+        except CookidooAuthException:
+            await self._api_client.refresh_token()
+            recipe = await self._api_client.add_custom_recipe_from(recipe_id, servings)
+        return _custom_recipe_to_dict(recipe)
 
     async def update_custom_recipe(self, recipe_id: str, recipe) -> None:
         """PATCH an existing custom recipe with a full recipe body.

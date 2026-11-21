@@ -8,6 +8,52 @@ from typing import Annotated, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+# Device-supported values, mirrored from cookidoo-api's ThermomixSpeed /
+# ThermomixTemperature enums. The backend rejects anything else at upload time;
+# validating here turns a late upload failure into an early, explicit error.
+ALLOWED_SPEEDS: frozenset[str] = frozenset(
+    {"soft"} | {f"{x / 2:g}" for x in range(1, 21)}  # soft, 0.5, 1, 1.5, ... 10
+)
+ALLOWED_TEMPERATURES: frozenset[int] = frozenset(
+    {37, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 98, 100, 105, 110, 115, 120}
+)
+
+Speed = str
+Temperature = Union[int, str]
+
+
+def _check_speed(v: object) -> Optional[str]:
+    if v is None:
+        return v
+    v = str(v).strip().lower()
+    try:
+        v = f"{float(v):g}"  # "4.0" / 4 -> "4", "0.50" -> "0.5"
+    except ValueError:
+        pass
+    if v not in ALLOWED_SPEEDS:
+        raise ValueError(
+            "speed must be 'soft' or 0.5-10 in steps of 0.5 (e.g. '0.5', '4', '10')"
+        )
+    return v
+
+
+def _check_temperature(v: Optional[Temperature]) -> Optional[Temperature]:
+    if v is None:
+        return v
+    if isinstance(v, str):
+        if v.strip().lower() == "varoma":
+            return "varoma"
+        if not v.strip().isdigit():
+            raise ValueError("temperature must be an integer °C or 'varoma'")
+        v = int(v.strip())
+    if isinstance(v, bool) or not isinstance(v, int):
+        raise ValueError("temperature must be an integer °C or 'varoma'")
+    if v not in ALLOWED_TEMPERATURES:
+        raise ValueError(
+            f"temperature must be 'varoma' or one of {sorted(ALLOWED_TEMPERATURES)} °C"
+        )
+    return v
+
 
 class TTSAction(BaseModel):
     """Standard cooking / mixing action — a play button on the TM7.
@@ -19,23 +65,46 @@ class TTSAction(BaseModel):
 
     kind: Literal["tts"] = "tts"
     time: int = Field(..., description="Duration in seconds", ge=1, le=32400)
-    speed: str = Field(..., description="Speed setting label, e.g. '5' or '0.5'")
-    temperature: Optional[int] = Field(
+    speed: Speed = Field(..., description="'soft' or '0.5'-'10' in steps of 0.5")
+    temperature: Optional[Temperature] = Field(
         default=None,
-        description="Temperature in °C (discrete device-supported values only); omit for speed-only actions",
+        description="°C (37, 40, 45 ... 120) or 'varoma'; omit for speed-only actions",
     )
     direction: Optional[Literal["reverse"]] = Field(
         default=None,
         description="'reverse' for Linkslauf; omit for the default clockwise direction",
     )
 
+    @field_validator("speed", mode="before")
+    @classmethod
+    def _v_speed(cls, v):
+        return _check_speed(v)
+
+    @field_validator("temperature", mode="before")
+    @classmethod
+    def _v_temp(cls, v):
+        return _check_temperature(v)
+
 
 class SteamingAction(BaseModel):
-    """Varoma steaming action. Accessory is always 'Varoma'."""
+    """Steaming mode (Varoma and/or simmering basket)."""
 
     kind: Literal["steaming"] = "steaming"
     time: int = Field(..., description="Duration in seconds", ge=1, le=32400)
-    speed: str = Field(..., description="Speed setting label, e.g. '2'")
+    speed: Speed = Field(..., description="Speed label, e.g. '1' or '2'")
+    accessory: Literal["Varoma", "SimmeringBasket", "VaromaAndSimmeringBasket"] = Field(
+        default="Varoma",
+        description="Which steaming accessory is in use",
+    )
+    direction: Optional[Literal["reverse"]] = Field(
+        default=None,
+        description="'reverse' for Linkslauf; omit for the default clockwise direction",
+    )
+
+    @field_validator("speed", mode="before")
+    @classmethod
+    def _v_speed(cls, v):
+        return _check_speed(v)
 
 
 class BrowningAction(BaseModel):
@@ -58,8 +127,37 @@ class BrowningAction(BaseModel):
         return v
 
 
+class ModeAction(BaseModel):
+    """Other TM7 modes: dough kneading, turbo, blend, warm up, rice cooker.
+
+    EXPERIMENTAL: the field set mirrors cookidoo-api's ``CookidooModeAnnotation``;
+    which fields each mode requires is not yet confirmed against the backend.
+    Upload rolls back on rejection, so a wrong shape fails loudly.
+    """
+
+    kind: Literal["dough", "turbo", "blend", "warm_up", "rice_cooker"]
+    time: Optional[int] = Field(default=None, description="Duration in seconds", ge=1, le=32400)
+    speed: Optional[Speed] = Field(default=None, description="Speed label, if the mode takes one")
+    temperature: Optional[Temperature] = Field(
+        default=None, description="°C or 'varoma', if the mode takes one"
+    )
+    direction: Optional[Literal["reverse"]] = Field(
+        default=None, description="'reverse' for Linkslauf, if the mode takes one"
+    )
+
+    @field_validator("speed", mode="before")
+    @classmethod
+    def _v_speed(cls, v):
+        return _check_speed(v)
+
+    @field_validator("temperature", mode="before")
+    @classmethod
+    def _v_temp(cls, v):
+        return _check_temperature(v)
+
+
 RecipeAction = Annotated[
-    Union[TTSAction, SteamingAction, BrowningAction],
+    Union[TTSAction, SteamingAction, BrowningAction, ModeAction],
     Field(discriminator="kind"),
 ]
 
@@ -99,8 +197,8 @@ class CustomRecipe(BaseModel):
                     "Add egg and mix well",
                     "Add flour and chocolate chips",
                     {
-                        "text": "Bake at 180°C for 12 minutes",
-                        "action": {"kind": "tts", "time": 720, "speed": "0", "temperature": 180},
+                        "text": "Cook 12 min at 100°C on speed 1",
+                        "action": {"kind": "tts", "time": 720, "speed": "1", "temperature": 100},
                     },
                 ],
                 "servings": 6,
