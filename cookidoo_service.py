@@ -40,6 +40,7 @@ _BROWNING_SPAN_RE = re.compile(
 _TIME_RE = re.compile(r"(\d+)\s*(Sek\.?|sec|Min\.?|min)", re.IGNORECASE)
 _SPEED_RE = re.compile(r"Stufe\s*(\d+(?:[.,]\d+)?)", re.IGNORECASE)
 _TEMP_RE = re.compile(r"(\d+)\s*°\s*C|([Vv]aroma)")
+_REVERSE_RE = re.compile(r"/\s*(?:Linkslauf|sens inverse|reverse)\s*/", re.IGNORECASE)
 _POWER_RE = re.compile(r"(Leicht|Intensiv|Gentle|Intense)", re.IGNORECASE)
 # BROWNING temperature enum (Celsius): only these discrete values are accepted.
 _BROWNING_TEMPS = {"140", "145", "150", "155", "160"}
@@ -90,7 +91,7 @@ def _parse_action(text: str) -> Optional[tuple[str, Optional[str], dict]]:
     Parse a TM action span into (annotation_type, annotation_name, data).
 
     - Standard cooking ('5 Sek./Stufe 5', '3 Min./120°C/Linkslauf/Stufe 1')
-      → ("TTS", None, {time, speed, temperature?})
+      → ("TTS", None, {time, speed, temperature?, direction?})
     - Varoma steaming ('15 Min./Varoma/Stufe 2')
       → ("MODE", "STEAMING", {time, speed, direction, accessory})
     """
@@ -129,6 +130,8 @@ def _parse_action(text: str) -> Optional[tuple[str, Optional[str], dict]]:
     data: dict = {"speed": speed, "time": seconds}
     if m_temp:
         data["temperature"] = {"value": m_temp.group(1), "unit": "C"}
+    if _REVERSE_RE.search(text):
+        data["direction"] = "CCW"
     return ("TTS", None, data)
 
 
@@ -267,6 +270,10 @@ def _annotations_from_action(text: str, action, ingredients: list[str]) -> list[
         data: dict = {"speed": action.speed, "time": action.time}
         if getattr(action, "temperature", None) is not None:
             data["temperature"] = {"value": str(action.temperature), "unit": "C"}
+        if getattr(action, "direction", None) == "reverse":
+            # Cookidoo wire value for reverse rotation (Linkslauf); clockwise
+            # is the default and is omitted, matching official recipes.
+            data["direction"] = "CCW"
         return [{"type": "TTS", "data": data, "position": dict(span)}]
     if action.kind == "steaming":
         return [

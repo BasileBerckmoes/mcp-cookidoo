@@ -150,3 +150,50 @@ def test_structured_action_annotation_language_neutral() -> None:
         assert anns[0]["type"] == "TTS"
         assert anns[0]["data"] == {"speed": "5", "time": 5}
         assert anns[0]["position"] == {"offset": 0, "length": len(text)}
+
+
+def test_tts_action_reverse_emits_ccw_direction() -> None:
+    text = "Mix 2 min at speed 1 in reverse."
+    action = TTSAction(time=120, speed="1", direction="reverse")
+    anns = _annotations_from_action(text, action, ingredients=[])
+    assert anns[0]["data"]["direction"] == "CCW"
+
+
+def test_tts_action_reverse_with_temperature_keeps_all_fields() -> None:
+    text = "Cook 12 min at 100°C, reverse, speed 1."
+    action = TTSAction(time=720, speed="1", temperature=100, direction="reverse")
+    anns = _annotations_from_action(text, action, ingredients=[])
+    assert anns[0]["data"] == {
+        "speed": "1",
+        "time": 720,
+        "temperature": {"value": "100", "unit": "C"},
+        "direction": "CCW",
+    }
+
+
+def test_tts_action_default_direction_is_omitted() -> None:
+    action = TTSAction(time=5, speed="5")
+    anns = _annotations_from_action("Mix 5 sec at speed 5.", action, ingredients=[])
+    assert "direction" not in anns[0]["data"]
+
+
+def test_tts_action_reverse_survives_full_payload_build() -> None:
+    step = RecipeStep(
+        text="Meng 2 min op stand 1, linksdraaiend.",
+        action=TTSAction(time=120, speed="1", direction="reverse"),
+    )
+    instr = _step_to_instruction(step, ingredients=[])
+    tts = [a for a in instr["annotations"] if a["type"] == "TTS"]
+    assert tts and tts[0]["data"]["direction"] == "CCW"
+
+
+def test_legacy_german_linkslauf_text_emits_ccw() -> None:
+    instr = build_instruction("3 Min./120°C/Linkslauf/Stufe 1", ingredients=[])
+    tts = [a for a in instr["annotations"] if a["type"] == "TTS"]
+    assert tts[0]["data"]["direction"] == "CCW"
+
+
+def test_legacy_german_text_without_linkslauf_has_no_direction() -> None:
+    instr = build_instruction("5 Sek./Stufe 5", ingredients=[])
+    tts = [a for a in instr["annotations"] if a["type"] == "TTS"]
+    assert "direction" not in tts[0]["data"]
