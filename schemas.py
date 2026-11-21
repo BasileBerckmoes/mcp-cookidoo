@@ -240,3 +240,87 @@ class CustomRecipe(BaseModel):
         if not isinstance(v, list):
             return v
         return [{"text": s} if isinstance(s, str) else s for s in v]
+
+
+# --- Surgical edits on an existing custom recipe (customize_custom_recipe) ---
+#
+# Step numbers are 1-based and always refer to the recipe *as read*, before
+# any edit in the same call, so ops never shift each other's targets.
+
+
+class ReplaceStepOp(BaseModel):
+    op: Literal["replace_step"]
+    step: int = Field(..., ge=1, description="1-based step number in the recipe as read")
+    with_steps: list[RecipeStep] = Field(
+        ..., alias="with", min_length=1, description="One or more steps that replace it"
+    )
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class InsertStepsOp(BaseModel):
+    op: Literal["insert_steps"]
+    after: int = Field(..., ge=0, description="Insert after this step number; 0 = at the start")
+    steps: list[RecipeStep] = Field(..., min_length=1)
+
+
+class DeleteStepsOp(BaseModel):
+    op: Literal["delete_steps"]
+    steps: list[int] = Field(..., min_length=1, description="1-based step numbers to delete")
+
+
+class ReplaceIngredientOp(BaseModel):
+    op: Literal["replace_ingredient"]
+    old: str = Field(..., min_length=1, description="Exact current ingredient line")
+    new: str = Field(..., min_length=1)
+
+
+class AddIngredientOp(BaseModel):
+    op: Literal["add_ingredient"]
+    ingredient: str = Field(..., min_length=1)
+    after: Optional[str] = Field(
+        default=None, description="Exact ingredient line to insert after; omit to append"
+    )
+
+
+class RemoveIngredientOp(BaseModel):
+    op: Literal["remove_ingredient"]
+    ingredient: str = Field(..., min_length=1, description="Exact current ingredient line")
+
+
+class SetHintsOp(BaseModel):
+    op: Literal["set_hints"]
+    hints: list[str] = Field(..., description="Replaces all hints; [] clears them")
+
+
+class RenameOp(BaseModel):
+    op: Literal["rename"]
+    name: str = Field(..., min_length=1, max_length=200)
+
+
+class SetMetaOp(BaseModel):
+    """Servings and times. Changing servings does not rescale ingredients."""
+
+    op: Literal["set_meta"]
+    servings: Optional[int] = Field(default=None, ge=1, le=20)
+    prep_time: Optional[int] = Field(default=None, ge=1, le=1440, description="Minutes")
+    total_time: Optional[int] = Field(default=None, ge=1, le=1440, description="Minutes")
+
+
+RecipeEdit = Annotated[
+    Union[
+        ReplaceStepOp,
+        InsertStepsOp,
+        DeleteStepsOp,
+        ReplaceIngredientOp,
+        AddIngredientOp,
+        RemoveIngredientOp,
+        SetHintsOp,
+        RenameOp,
+        SetMetaOp,
+    ],
+    Field(discriminator="op"),
+]
+
+
+class RecipeEdits(BaseModel):
+    edits: list[RecipeEdit] = Field(..., min_length=1)

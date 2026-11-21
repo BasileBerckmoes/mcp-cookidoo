@@ -544,6 +544,175 @@ def _custom_recipe_to_dict(recipe) -> dict:
     }
 
 
+class RecipeEditError(ValueError):
+    """An edit can't be applied safely; nothing is sent to Cookidoo."""
+
+
+def _raw_content(raw: dict) -> dict:
+    """Return the ``recipeContent`` of a full+json read, or refuse.
+
+    Only the full representation carries step annotations. If the backend
+    sends anything else (e.g. the schema.org projection), patching
+    ``instructions`` would wipe the play buttons of untouched steps, so we
+    refuse instead of guessing.
+    """
+    content = raw.get("recipeContent") if isinstance(raw, dict) else None
+    if not isinstance(content, dict):
+        raise RecipeEditError("Backend did not return recipeContent; refusing to edit.")
+    instructions = content.get("instructions")
+    if not isinstance(instructions, list) or not all(
+        isinstance(i, dict) and isinstance(i.get("text"), str) for i in instructions
+    ):
+        raise RecipeEditError(
+            "Backend did not return structured instructions (full recipe); refusing to "
+            "edit so the play buttons of untouched steps aren't wiped."
+        )
+    return content
+
+
+def _ingredient_text(item) -> str:
+    return item.get("text", "") if isinstance(item, dict) else str(item)
+
+
+def apply_recipe_edits(raw: dict, edits: list) -> tuple[dict, dict]:
+    """Apply surgical edits to a raw full+json custom recipe.
+
+    Returns ``(patch_body, summary)``. ``patch_body`` holds only the top-level
+    fields that changed — the backend's partial-PATCH semantics leave the rest
+    (image, cookTime, workStatus, …) untouched. Untouched steps and
+    ingredients are passed through byte-for-byte, annotations and all; only
+    new steps are built, via :func:`_step_to_instruction`.
+
+    Step numbers in every op refer to the recipe as read (1-based), so ops in
+    one call never shift each other's targets.
+    """
+    content = _raw_content(raw)
+    orig_steps: list[dict] = list(content["instructions"])
+    n = len(orig_steps)
+    ingredients: list = list(content.get("ingredients") or [])
+    patch: dict = {}
+
+    def check_step(k: int) -> int:
+        if not 1 <= k <= n:
+            raise RecipeEditError(f"Step {k} does not exist (recipe has {n} steps).")
+        return k
+
+    # 1) ingredient ops first, so new steps link against the final list
+    def find_ing(text: str) -> int:
+        for i, item in enumerate(ingredients):
+            if _ingredient_text(item) == text:
+                return i
+        raise RecipeEditError(f"Ingredient not found (exact match needed): {text!r}")
+
+    ingredients_changed = False
+    for e in edits:
+        if e.op == "replace_ingredient":
+            i = find_ing(e.old)
+            item = ingredients[i]
+            ingredients[i] = {**item, "text": e.new} if isinstance(item, dict) else {"type": "INGREDIENT", "text": e.new}
+            ingredients_changed = True
+        elif e.op == "add_ingredient":
+            new_item = {"type": "INGREDIENT", "text": e.ingredient}
+            if e.after is None:
+                ingredients.append(new_item)
+            else:
+                ingredients.insert(find_ing(e.after) + 1, new_item)
+            ingredients_changed = True
+        elif e.op == "remove_ingredient":
+            ingredients.pop(find_ing(e.ingredient))
+            ingredients_changed = True
+    ing_texts = [_ingredient_text(i) for i in ingredients]
+
+    # 2) step ops, keyed on original numbering
+    replaced: dict[int, list] = {}
+    deleted: set[int] = set()
+    inserts: dict[int, list] = {}
+    for e in edits:
+        if e.op == "replace_step":
+            k = check_step(e.step)
+            if k in replaced or k in deleted:
+                raise RecipeEditError(f"Step {k} is targeted by more than one replace/delete.")
+            replaced[k] = list(e.with_steps)
+        elif e.op == "delete_steps":
+            for k in e.steps:
+                check_step(k)
+                if k in replaced or k in deleted:
+                    raise RecipeEditError(f"Step {k} is targeted by more than one replace/delete.")
+                deleted.add(k)
+        elif e.op == "insert_steps":
+            if not 0 <= e.after <= n:
+                raise RecipeEditError(f"insert_steps after={e.after} is out of range 0..{n}.")
+            inserts.setdefault(e.after, []).extend(e.steps)
+
+    steps_changed = bool(replaced or deleted or inserts)
+    new_steps: list[dict] = []
+    origin: list[str] = []  # per output step: "kept N", "new", for the preview
+    for s_new in inserts.get(0, []):
+        new_steps.append(_step_to_instruction(s_new, ing_texts)); origin.append("new")
+    for k in range(1, n + 1):
+        if k in replaced:
+            for s_new in replaced[k]:
+                new_steps.append(_step_to_instruction(s_new, ing_texts)); origin.append(f"replaces {k}")
+        elif k not in deleted:
+            new_steps.append(orig_steps[k - 1]); origin.append(f"kept {k}")
+        for s_new in inserts.get(k, []):
+            new_steps.append(_step_to_instruction(s_new, ing_texts)); origin.append("new")
+
+    if not new_steps:
+        raise RecipeEditError("Edits would leave the recipe without steps.")
+
+    # 3) every INGREDIENT link in the result must point at a real ingredient
+    if ingredients_changed or steps_changed:
+        dangling = []
+        for idx, st in enumerate(new_steps, 1):
+            for a in st.get("annotations") or []:
+                if a.get("type") == "INGREDIENT":
+                    desc = (a.get("data") or {}).get("description")
+                    if desc not in ing_texts:
+                        dangling.append(f"step {idx} ({origin[idx - 1]}) links {desc!r}")
+        if dangling:
+            raise RecipeEditError(
+                "These steps link ingredients that no longer exist; edit or replace them too: "
+                + "; ".join(dangling)
+            )
+
+    if steps_changed:
+        patch["instructions"] = new_steps
+    if ingredients_changed:
+        patch["ingredients"] = ingredients
+
+    for e in edits:
+        if e.op == "set_hints":
+            patch["hints"] = "\n".join(e.hints)
+        elif e.op == "rename":
+            patch["name"] = e.name
+        elif e.op == "set_meta":
+            if e.servings is not None:
+                y = dict(content.get("yield") or {"unitText": "portion"})
+                y["value"] = e.servings
+                patch["yield"] = y
+            if e.prep_time is not None:
+                patch["prepTime"] = e.prep_time * 60
+            if e.total_time is not None:
+                patch["totalTime"] = e.total_time * 60
+
+    prep = patch.get("prepTime", content.get("prepTime"))
+    total = patch.get("totalTime", content.get("totalTime"))
+    if isinstance(prep, int) and isinstance(total, int) and prep > total:
+        raise RecipeEditError("Prep time would exceed total time.")
+
+    summary = {
+        "changed_fields": sorted(patch),
+        "steps": [
+            {"n": i, "origin": origin[i - 1], "text": st.get("text", ""),
+             "play_button": any(a.get("type") in ("TTS", "MODE") for a in st.get("annotations") or [])}
+            for i, st in enumerate(new_steps, 1)
+        ] if steps_changed else None,
+        "ingredients": ing_texts if ingredients_changed else None,
+    }
+    return patch, summary
+
+
 def load_cookidoo_credentials() -> tuple[str, str]:
     """
     Load Cookidoo credentials from .env file.
@@ -796,6 +965,37 @@ class CookidooService:
             await self._api_client.refresh_token()
             recipe = await self._api_client.add_custom_recipe_from(recipe_id, servings)
         return _custom_recipe_to_dict(recipe)
+
+    async def customize_custom_recipe(
+        self, recipe_id: str, edits: list, dry_run: bool = False
+    ) -> dict:
+        """Read the full recipe, apply surgical edits, PATCH only what changed.
+
+        See :func:`apply_recipe_edits`. With ``dry_run`` nothing is sent; the
+        summary shows the resulting steps for approval.
+        """
+        if not self._api_client or not self._session:
+            raise Exception("Not authenticated. Please call login() first.")
+        url = self._custom_recipe_url(recipe_id)
+        status, text = await self._authed_request(
+            "GET", url, accept="application/vnd.vorwerk.customer-recipe.full+json"
+        )
+        if status != 200:
+            raise Exception(f"Failed to read recipe. Status: {status}, Error: {text[:300]}")
+        patch, summary = apply_recipe_edits(json.loads(text), edits)
+        summary["dry_run"] = dry_run
+        if dry_run or not patch:
+            return summary
+        status, text = await self._authed_request("PATCH", url, json_body=patch)
+        if status not in (200, 204):
+            raise Exception(f"Failed to update recipe. Status: {status}, Error: {text[:300]}")
+        return summary
+
+    def _custom_recipe_url(self, recipe_id: str) -> str:
+        localization = self._api_client.localization
+        url_parts = localization.url.split("/")
+        base_url = f"{url_parts[0]}//{url_parts[2]}"
+        return f"{base_url}/created-recipes/{localization.language}/{recipe_id}"
 
     async def update_custom_recipe(self, recipe_id: str, recipe) -> None:
         """PATCH an existing custom recipe with a full recipe body.

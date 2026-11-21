@@ -18,10 +18,11 @@ from starlette.routing import Route
 
 from cookidoo_service import (
     CookidooService,
+    RecipeEditError,
     build_step_annotations,
     load_cookidoo_credentials,
 )
-from schemas import CustomRecipe
+from schemas import CustomRecipe, RecipeEdits
 
 VERSION = "0.2.0"
 API_TOKEN = os.environ.get("COOKIDOO_API_TOKEN", "")
@@ -602,6 +603,71 @@ async def update_custom_recipe(
         f"Recipe {recipe_id} updated to '{recipe.name}' "
         f"(quality {quality['score']}/100)."
     )
+
+
+@mcp.tool()
+async def customize_custom_recipe(recipe_id: str, edits_json: str, dry_run: bool = True) -> str:
+    """
+    Surgically edit one of the user's custom recipes (typically a copy made
+    with copy_official_recipe): replace, insert or delete individual steps,
+    change ingredients, hints, name, servings or times.
+
+    Unlike update_custom_recipe, untouched steps and ingredients are sent back
+    exactly as Cookidoo stored them, so their play buttons and ingredient
+    links survive even on official-recipe copies. Only changed fields are
+    PATCHed; photo and cook time are kept.
+
+    dry_run=True (default) changes nothing and returns a preview of the result.
+    Show it to the user, then call again with dry_run=False after approval.
+
+    edits_json: {"edits": [ ... ]} with ops (step numbers are 1-based and
+    always refer to the recipe as read, before any edit in this call):
+      {"op": "replace_step", "step": 7, "with": [<RecipeStep>, ...]}
+      {"op": "insert_steps", "after": 3, "steps": [<RecipeStep>, ...]}   (after 0 = start)
+      {"op": "delete_steps", "steps": [4, 5]}
+      {"op": "replace_ingredient", "old": "<exact line>", "new": "<line>"}
+      {"op": "add_ingredient", "ingredient": "<line>", "after": "<exact line, optional>"}
+      {"op": "remove_ingredient", "ingredient": "<exact line>"}
+      {"op": "set_hints", "hints": ["...", ...]}          ([] clears)
+      {"op": "rename", "name": "..."}
+      {"op": "set_meta", "servings": 4, "prep_time": 20, "total_time": 60}  (minutes)
+    A <RecipeStep> is {"text": "...", "action": {...} | null}, same as upload.
+    The edit is refused if any resulting step still links an ingredient that
+    no longer exists — edit or replace those steps in the same call.
+    """
+    error, service = await _ensure_connected()
+    if error:
+        return error
+    try:
+        edits = RecipeEdits(**json.loads(edits_json)).edits
+    except json.JSONDecodeError as e:
+        return f"Invalid JSON: {e}"
+    except Exception as e:
+        return f"Invalid edits: {e}"
+    try:
+        summary = await service.customize_custom_recipe(recipe_id, edits, dry_run=dry_run)
+    except RecipeEditError as e:
+        return f"Edit refused, nothing changed: {e}"
+    except Exception as e:
+        return f"Customize failed: {e}"
+
+    lines = [
+        ("PREVIEW (nothing changed yet)" if dry_run else "Recipe updated") + f" — {recipe_id}",
+        f"Changed fields: {', '.join(summary['changed_fields']) or 'none'}",
+    ]
+    if summary.get("steps"):
+        lines.append("")
+        lines.append("Resulting steps:")
+        for st in summary["steps"]:
+            mark = " ▶" if st["play_button"] else ""
+            lines.append(f"{st['n']}. [{st['origin']}] {st['text']}{mark}")
+    if summary.get("ingredients"):
+        lines.append("")
+        lines.append("Resulting ingredients:")
+        lines += [f"  • {i}" for i in summary["ingredients"]]
+    if dry_run:
+        lines += ["", "Call again with dry_run=False to apply."]
+    return "\n".join(lines)
 
 
 @mcp.tool()
