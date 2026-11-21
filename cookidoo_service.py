@@ -574,6 +574,17 @@ def _ingredient_text(item) -> str:
     return item.get("text", "") if isinstance(item, dict) else str(item)
 
 
+def _link_text(desc) -> Optional[str]:
+    """Ingredient-link description → ingredient line.
+
+    Annotations we write carry a plain string; Cookidoo returns stored links
+    as an object (``{"text": "1 vanilla pod", ...}``). Accept both.
+    """
+    if isinstance(desc, dict):
+        return desc.get("text")
+    return desc
+
+
 def apply_recipe_edits(raw: dict, edits: list) -> tuple[dict, dict]:
     """Apply surgical edits to a raw full+json custom recipe.
 
@@ -667,7 +678,7 @@ def apply_recipe_edits(raw: dict, edits: list) -> tuple[dict, dict]:
         for idx, st in enumerate(new_steps, 1):
             for a in st.get("annotations") or []:
                 if a.get("type") == "INGREDIENT":
-                    desc = (a.get("data") or {}).get("description")
+                    desc = _link_text((a.get("data") or {}).get("description"))
                     if desc not in ing_texts:
                         dangling.append(f"step {idx} ({origin[idx - 1]}) links {desc!r}")
         if dangling:

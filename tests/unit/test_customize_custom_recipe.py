@@ -189,3 +189,29 @@ async def test_apply_patches_only_changed_fields() -> None:
     method, url, body, _ = calls[1]
     assert method == "PATCH" and url.endswith("/created-recipes/nl-BE/01COPY")
     assert set(body) == {"instructions"}
+
+
+# Cookidoo returns stored ingredient links as objects, not strings.
+RAW_OBJ_LINKS = copy.deepcopy(RAW)
+for _st in RAW_OBJ_LINKS["recipeContent"]["instructions"]:
+    for _a in _st.get("annotations") or []:
+        if _a["type"] == "INGREDIENT":
+            _a["data"]["description"] = {"text": _a["data"]["description"], "id": "x"}
+
+
+def test_object_shaped_links_on_kept_steps_are_not_dangling() -> None:
+    patch, _ = apply_recipe_edits(copy.deepcopy(RAW_OBJ_LINKS), edits({"op": "delete_steps", "steps": [4]}))
+    assert patch["instructions"][0] == RAW_OBJ_LINKS["recipeContent"]["instructions"][0]
+
+
+def test_egg_swap_on_object_shaped_links() -> None:
+    patch, _ = apply_recipe_edits(copy.deepcopy(RAW_OBJ_LINKS), EGG_SWAP)
+    assert len(patch["instructions"]) == 5
+
+
+def test_object_shaped_link_to_removed_ingredient_still_refused() -> None:
+    with pytest.raises(RecipeEditError, match="600 g kipfilet"):
+        apply_recipe_edits(
+            copy.deepcopy(RAW_OBJ_LINKS),
+            edits({"op": "remove_ingredient", "ingredient": "600 g kipfilet"}),
+        )
