@@ -249,8 +249,26 @@ def build_instruction(text: str, ingredients: list[str]) -> dict:
     return {
         "type": "STEP",
         "text": text,
-        "annotations": build_step_annotations(text, ingredients),
+        "annotations": _to_utf16_positions(text, build_step_annotations(text, ingredients)),
     }
+
+
+def _temperature_json(value) -> dict:
+    """Serialize a temperature the way Cookidoo stores it.
+
+    Numeric °C → ``{"value": "100", "unit": "C"}``; Varoma → ``{"value": "varoma"}``
+    (no unit), matching cookidoo-api's ``_temperature_to_json``.
+    """
+    if isinstance(value, str) and value.lower() == "varoma":
+        return {"value": "varoma"}
+    return {"value": str(value), "unit": "C"}
+
+
+def _direction_json(action) -> str:
+    return "CCW" if getattr(action, "direction", None) == "reverse" else "CW"
+
+
+_OTHER_MODES = ("dough", "turbo", "blend", "warm_up", "rice_cooker")
 
 
 def _annotations_from_action(text: str, action, ingredients: list[str]) -> list[dict]:
@@ -259,17 +277,17 @@ def _annotations_from_action(text: str, action, ingredients: list[str]) -> list[
     The action carries the numeric/enum values directly, so no text parsing is
     needed — the step text can be in any language. The annotation spans the
     full step text (offset=0, length=len(text)); callers keep step text short
-    and action-only, per the "one action per step" rule.
+    and action-only, per the "one action per step" rule. Positions here are
+    Python indices; :func:`_to_utf16_positions` converts them for the wire.
 
-    ``action`` is duck-typed as anything with the fields on
-    :class:`schemas.TTSAction` / :class:`schemas.SteamingAction` /
-    :class:`schemas.BrowningAction`, discriminated by ``action.kind``.
+    ``action`` is duck-typed as anything with the fields on the
+    :mod:`schemas` action models, discriminated by ``action.kind``.
     """
     span = {"offset": 0, "length": len(text)}
     if action.kind == "tts":
         data: dict = {"speed": action.speed, "time": action.time}
         if getattr(action, "temperature", None) is not None:
-            data["temperature"] = {"value": str(action.temperature), "unit": "C"}
+            data["temperature"] = _temperature_json(action.temperature)
         if getattr(action, "direction", None) == "reverse":
             # Cookidoo wire value for reverse rotation (Linkslauf); clockwise
             # is the default and is omitted, matching official recipes.
@@ -283,8 +301,8 @@ def _annotations_from_action(text: str, action, ingredients: list[str]) -> list[
                 "data": {
                     "time": action.time,
                     "speed": action.speed,
-                    "direction": "CW",
-                    "accessory": "Varoma",
+                    "direction": _direction_json(action),
+                    "accessory": getattr(action, "accessory", None) or "Varoma",
                 },
                 "position": dict(span),
             }
@@ -296,13 +314,142 @@ def _annotations_from_action(text: str, action, ingredients: list[str]) -> list[
                 "name": "BROWNING",
                 "data": {
                     "time": action.time,
-                    "temperature": {"value": str(action.temperature), "unit": "C"},
+                    "temperature": _temperature_json(action.temperature),
                     "power": action.power,
                 },
                 "position": dict(span),
             }
         ]
+    if action.kind in _OTHER_MODES:
+        data = {}
+        if getattr(action, "time", None) is not None:
+            data["time"] = action.time
+        if getattr(action, "temperature", None) is not None:
+            data["temperature"] = _temperature_json(action.temperature)
+        if getattr(action, "speed", None) is not None:
+            data["speed"] = action.speed
+        if getattr(action, "direction", None) == "reverse":
+            data["direction"] = "CCW"
+        return [
+            {
+                "type": "MODE",
+                "name": action.kind.upper(),
+                "data": data,
+                "position": dict(span),
+            }
+        ]
     raise ValueError(f"Unknown action kind: {action.kind!r}")
+
+
+def _utf16_len(s: str) -> int:
+    return len(s.encode("utf-16-le")) // 2
+
+
+def _to_utf16_positions(text: str, annotations: list[dict]) -> list[dict]:
+    """Convert annotation positions from Python indices to UTF-16 code units.
+
+    Cookidoo (a JavaScript backend) counts offsets/lengths in UTF-16 code
+    units. Python indexes by code point, so any astral character (emoji) before
+    or inside a span shifts it. Pure-BMP text is unchanged.
+    """
+    if _utf16_len(text) == len(text):
+        return annotations
+    out = []
+    for a in annotations:
+        pos = a.get("position")
+        if not pos:
+            out.append(a)
+            continue
+        off, ln = pos["offset"], pos["length"]
+        b = dict(a)
+        b["position"] = {
+            "offset": _utf16_len(text[:off]),
+            "length": _utf16_len(text[off:off + ln]),
+        }
+        out.append(b)
+    return out
+
+
+def _temp_from_annotation(temperature) -> object:
+    """cookidoo-api CookidooTemperatureSetting → schema temperature (int or 'varoma')."""
+    if temperature is None:
+        return None
+    value = getattr(temperature, "value", temperature)
+    value = getattr(value, "value", value)  # StrEnum
+    if str(value).lower() == "varoma":
+        return "varoma"
+    try:
+        return int(str(value))
+    except ValueError:
+        return str(value)
+
+
+def _enum(v):
+    return getattr(v, "value", v)
+
+
+def action_from_annotation(ann) -> Optional[dict]:
+    """Map a parsed cookidoo-api annotation back to a schema action dict.
+
+    Inverse of :func:`_annotations_from_action`, so a recipe read with
+    ``get_custom_recipe`` can be fed straight back into ``update_custom_recipe``
+    without losing play buttons. Ingredient annotations return ``None``: they
+    are re-derived from the step text on every write.
+    """
+    cls = type(ann).__name__
+    if cls == "CookidooTTSAnnotation":
+        action: dict = {"kind": "tts", "time": ann.time, "speed": _enum(ann.speed)}
+        temp = _temp_from_annotation(ann.temperature)
+        if temp is not None:
+            action["temperature"] = temp
+        if _enum(ann.direction) == "CCW":
+            action["direction"] = "reverse"
+        return action
+    if cls == "CookidooModeAnnotation":
+        mode = str(_enum(ann.mode) or ann.name or "").lower()
+        if mode == "steaming":
+            action = {
+                "kind": "steaming",
+                "time": ann.time,
+                "speed": _enum(ann.speed),
+                "accessory": _enum(ann.accessory) or "Varoma",
+            }
+        elif mode == "browning":
+            action = {
+                "kind": "browning",
+                "time": ann.time,
+                "temperature": _temp_from_annotation(ann.temperature),
+                "power": _enum(ann.power),
+            }
+            return action
+        else:
+            action = {"kind": mode}
+            if ann.time is not None:
+                action["time"] = ann.time
+            temp = _temp_from_annotation(ann.temperature)
+            if temp is not None:
+                action["temperature"] = temp
+            if ann.speed is not None:
+                action["speed"] = _enum(ann.speed)
+        if _enum(ann.direction) == "CCW":
+            action["direction"] = "reverse"
+        return action
+    return None
+
+
+def step_from_instruction(instr) -> dict:
+    """cookidoo-api instruction (str or CookidooInstruction) → schema step dict."""
+    if isinstance(instr, str):
+        return {"text": instr, "action": None}
+    text = getattr(instr, "text", str(instr))
+    actions = [
+        a for a in (action_from_annotation(x) for x in getattr(instr, "annotations", []) or [])
+        if a is not None
+    ]
+    step: dict = {"text": text, "action": actions[0] if actions else None}
+    if len(actions) > 1:
+        step["extra_actions"] = actions[1:]  # schema allows one; surface the rest
+    return step
 
 
 def _step_to_instruction(step, ingredients: list[str]) -> dict:
@@ -320,7 +467,9 @@ def _step_to_instruction(step, ingredients: list[str]) -> dict:
         return {
             "type": "STEP",
             "text": step.text,
-            "annotations": _annotations_from_action(step.text, step.action, ingredients),
+            "annotations": _to_utf16_positions(
+                step.text, _annotations_from_action(step.text, step.action, ingredients)
+            ),
         }
     return build_instruction(normalize_action_step(step.text), ingredients)
 
@@ -363,6 +512,205 @@ def _build_recipe_payload(
         "workStatus": "PRIVATE",
         "recipeMetadata": {"requiresAnnotationsCheck": False},
     }
+
+
+def _custom_recipe_to_dict(recipe) -> dict:
+    """Project a cookidoo-api ``CookidooCustomRecipe`` into a read dict.
+
+    ``steps`` uses the same shape as :class:`schemas.RecipeStep`, so it can be
+    sent back through ``update_custom_recipe``. ``hints`` and step annotations
+    are only populated when cookidoo-api parses them (>= 0.19) *and* the
+    backend returns them; ``annotations_returned`` says whether any step came
+    back with a machine action.
+    """
+    instructions = list(recipe.instructions)
+    steps = [step_from_instruction(i) for i in instructions]
+    hints = getattr(recipe, "hints", None)
+    return {
+        "id": recipe.id,
+        "name": recipe.name,
+        "ingredients": list(recipe.ingredients),
+        "steps": steps,
+        "instructions": [st["text"] for st in steps],
+        "annotations_returned": any(st["action"] for st in steps),
+        "yield": {"value": recipe.serving_size, "unitText": getattr(recipe, "unit_text", "portion")},
+        "prepTime": recipe.active_time,
+        "cookTime": None,
+        "totalTime": recipe.total_time,
+        "tools": list(recipe.tools),
+        "hints": list(hints) if hints else None,
+        "image": recipe.image,
+        "url": recipe.url,
+    }
+
+
+class RecipeEditError(ValueError):
+    """An edit can't be applied safely; nothing is sent to Cookidoo."""
+
+
+def _raw_content(raw: dict) -> dict:
+    """Return the ``recipeContent`` of a full+json read, or refuse.
+
+    Only the full representation carries step annotations. If the backend
+    sends anything else (e.g. the schema.org projection), patching
+    ``instructions`` would wipe the play buttons of untouched steps, so we
+    refuse instead of guessing.
+    """
+    content = raw.get("recipeContent") if isinstance(raw, dict) else None
+    if not isinstance(content, dict):
+        raise RecipeEditError("Backend did not return recipeContent; refusing to edit.")
+    instructions = content.get("instructions")
+    if not isinstance(instructions, list) or not all(
+        isinstance(i, dict) and isinstance(i.get("text"), str) for i in instructions
+    ):
+        raise RecipeEditError(
+            "Backend did not return structured instructions (full recipe); refusing to "
+            "edit so the play buttons of untouched steps aren't wiped."
+        )
+    return content
+
+
+def _ingredient_text(item) -> str:
+    return item.get("text", "") if isinstance(item, dict) else str(item)
+
+
+def apply_recipe_edits(raw: dict, edits: list) -> tuple[dict, dict]:
+    """Apply surgical edits to a raw full+json custom recipe.
+
+    Returns ``(patch_body, summary)``. ``patch_body`` holds only the top-level
+    fields that changed — the backend's partial-PATCH semantics leave the rest
+    (image, cookTime, workStatus, …) untouched. Untouched steps and
+    ingredients are passed through byte-for-byte, annotations and all; only
+    new steps are built, via :func:`_step_to_instruction`.
+
+    Step numbers in every op refer to the recipe as read (1-based), so ops in
+    one call never shift each other's targets.
+    """
+    content = _raw_content(raw)
+    orig_steps: list[dict] = list(content["instructions"])
+    n = len(orig_steps)
+    ingredients: list = list(content.get("ingredients") or [])
+    patch: dict = {}
+
+    def check_step(k: int) -> int:
+        if not 1 <= k <= n:
+            raise RecipeEditError(f"Step {k} does not exist (recipe has {n} steps).")
+        return k
+
+    # 1) ingredient ops first, so new steps link against the final list
+    def find_ing(text: str) -> int:
+        for i, item in enumerate(ingredients):
+            if _ingredient_text(item) == text:
+                return i
+        raise RecipeEditError(f"Ingredient not found (exact match needed): {text!r}")
+
+    ingredients_changed = False
+    for e in edits:
+        if e.op == "replace_ingredient":
+            i = find_ing(e.old)
+            item = ingredients[i]
+            ingredients[i] = {**item, "text": e.new} if isinstance(item, dict) else {"type": "INGREDIENT", "text": e.new}
+            ingredients_changed = True
+        elif e.op == "add_ingredient":
+            new_item = {"type": "INGREDIENT", "text": e.ingredient}
+            if e.after is None:
+                ingredients.append(new_item)
+            else:
+                ingredients.insert(find_ing(e.after) + 1, new_item)
+            ingredients_changed = True
+        elif e.op == "remove_ingredient":
+            ingredients.pop(find_ing(e.ingredient))
+            ingredients_changed = True
+    ing_texts = [_ingredient_text(i) for i in ingredients]
+
+    # 2) step ops, keyed on original numbering
+    replaced: dict[int, list] = {}
+    deleted: set[int] = set()
+    inserts: dict[int, list] = {}
+    for e in edits:
+        if e.op == "replace_step":
+            k = check_step(e.step)
+            if k in replaced or k in deleted:
+                raise RecipeEditError(f"Step {k} is targeted by more than one replace/delete.")
+            replaced[k] = list(e.with_steps)
+        elif e.op == "delete_steps":
+            for k in e.steps:
+                check_step(k)
+                if k in replaced or k in deleted:
+                    raise RecipeEditError(f"Step {k} is targeted by more than one replace/delete.")
+                deleted.add(k)
+        elif e.op == "insert_steps":
+            if not 0 <= e.after <= n:
+                raise RecipeEditError(f"insert_steps after={e.after} is out of range 0..{n}.")
+            inserts.setdefault(e.after, []).extend(e.steps)
+
+    steps_changed = bool(replaced or deleted or inserts)
+    new_steps: list[dict] = []
+    origin: list[str] = []  # per output step: "kept N", "new", for the preview
+    for s_new in inserts.get(0, []):
+        new_steps.append(_step_to_instruction(s_new, ing_texts)); origin.append("new")
+    for k in range(1, n + 1):
+        if k in replaced:
+            for s_new in replaced[k]:
+                new_steps.append(_step_to_instruction(s_new, ing_texts)); origin.append(f"replaces {k}")
+        elif k not in deleted:
+            new_steps.append(orig_steps[k - 1]); origin.append(f"kept {k}")
+        for s_new in inserts.get(k, []):
+            new_steps.append(_step_to_instruction(s_new, ing_texts)); origin.append("new")
+
+    if not new_steps:
+        raise RecipeEditError("Edits would leave the recipe without steps.")
+
+    # 3) every INGREDIENT link in the result must point at a real ingredient
+    if ingredients_changed or steps_changed:
+        dangling = []
+        for idx, st in enumerate(new_steps, 1):
+            for a in st.get("annotations") or []:
+                if a.get("type") == "INGREDIENT":
+                    desc = (a.get("data") or {}).get("description")
+                    if desc not in ing_texts:
+                        dangling.append(f"step {idx} ({origin[idx - 1]}) links {desc!r}")
+        if dangling:
+            raise RecipeEditError(
+                "These steps link ingredients that no longer exist; edit or replace them too: "
+                + "; ".join(dangling)
+            )
+
+    if steps_changed:
+        patch["instructions"] = new_steps
+    if ingredients_changed:
+        patch["ingredients"] = ingredients
+
+    for e in edits:
+        if e.op == "set_hints":
+            patch["hints"] = "\n".join(e.hints)
+        elif e.op == "rename":
+            patch["name"] = e.name
+        elif e.op == "set_meta":
+            if e.servings is not None:
+                y = dict(content.get("yield") or {"unitText": "portion"})
+                y["value"] = e.servings
+                patch["yield"] = y
+            if e.prep_time is not None:
+                patch["prepTime"] = e.prep_time * 60
+            if e.total_time is not None:
+                patch["totalTime"] = e.total_time * 60
+
+    prep = patch.get("prepTime", content.get("prepTime"))
+    total = patch.get("totalTime", content.get("totalTime"))
+    if isinstance(prep, int) and isinstance(total, int) and prep > total:
+        raise RecipeEditError("Prep time would exceed total time.")
+
+    summary = {
+        "changed_fields": sorted(patch),
+        "steps": [
+            {"n": i, "origin": origin[i - 1], "text": st.get("text", ""),
+             "play_button": any(a.get("type") in ("TTS", "MODE") for a in st.get("annotations") or [])}
+            for i, st in enumerate(new_steps, 1)
+        ] if steps_changed else None,
+        "ingredients": ing_texts if ingredients_changed else None,
+    }
+    return patch, summary
 
 
 def load_cookidoo_credentials() -> tuple[str, str]:
@@ -600,20 +948,54 @@ class CookidooService:
             await self._api_client.refresh_token()
             recipe = await self._api_client.get_custom_recipe(recipe_id)
 
-        return {
-            "id": recipe.id,
-            "name": recipe.name,
-            "ingredients": list(recipe.ingredients),
-            "instructions": list(recipe.instructions),
-            "yield": {"value": recipe.serving_size, "unitText": "portion"},
-            "prepTime": recipe.active_time,
-            "cookTime": None,
-            "totalTime": recipe.total_time,
-            "tools": list(recipe.tools),
-            "hints": None,
-            "image": recipe.image,
-            "url": recipe.url,
-        }
+        return _custom_recipe_to_dict(recipe)
+
+    async def copy_official_recipe(self, recipe_id: str, servings: int) -> dict:
+        """Copy an official Cookidoo recipe into the user's custom recipes.
+
+        Uses the backend's native copy (``add_custom_recipe_from``), so the
+        copy keeps Cookidoo's own annotations — play buttons included —
+        rather than a rebuild from text.
+        """
+        if not self._api_client:
+            raise Exception("Not authenticated. Please call login() first.")
+        try:
+            recipe = await self._api_client.add_custom_recipe_from(recipe_id, servings)
+        except CookidooAuthException:
+            await self._api_client.refresh_token()
+            recipe = await self._api_client.add_custom_recipe_from(recipe_id, servings)
+        return _custom_recipe_to_dict(recipe)
+
+    async def customize_custom_recipe(
+        self, recipe_id: str, edits: list, dry_run: bool = False
+    ) -> dict:
+        """Read the full recipe, apply surgical edits, PATCH only what changed.
+
+        See :func:`apply_recipe_edits`. With ``dry_run`` nothing is sent; the
+        summary shows the resulting steps for approval.
+        """
+        if not self._api_client or not self._session:
+            raise Exception("Not authenticated. Please call login() first.")
+        url = self._custom_recipe_url(recipe_id)
+        status, text = await self._authed_request(
+            "GET", url, accept="application/vnd.vorwerk.customer-recipe.full+json"
+        )
+        if status != 200:
+            raise Exception(f"Failed to read recipe. Status: {status}, Error: {text[:300]}")
+        patch, summary = apply_recipe_edits(json.loads(text), edits)
+        summary["dry_run"] = dry_run
+        if dry_run or not patch:
+            return summary
+        status, text = await self._authed_request("PATCH", url, json_body=patch)
+        if status not in (200, 204):
+            raise Exception(f"Failed to update recipe. Status: {status}, Error: {text[:300]}")
+        return summary
+
+    def _custom_recipe_url(self, recipe_id: str) -> str:
+        localization = self._api_client.localization
+        url_parts = localization.url.split("/")
+        base_url = f"{url_parts[0]}//{url_parts[2]}"
+        return f"{base_url}/created-recipes/{localization.language}/{recipe_id}"
 
     async def update_custom_recipe(self, recipe_id: str, recipe) -> None:
         """PATCH an existing custom recipe with a full recipe body.

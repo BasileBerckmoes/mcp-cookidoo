@@ -18,10 +18,11 @@ from starlette.routing import Route
 
 from cookidoo_service import (
     CookidooService,
+    RecipeEditError,
     build_step_annotations,
     load_cookidoo_credentials,
 )
-from schemas import CustomRecipe
+from schemas import CustomRecipe, RecipeEdits
 
 VERSION = "0.2.0"
 API_TOKEN = os.environ.get("COOKIDOO_API_TOKEN", "")
@@ -305,9 +306,12 @@ async def get_custom_recipe(recipe_id: str) -> str:
     Complements get_recipe_details (which only works for official Cookidoo
     content) by reading recipes created via upload_custom_recipe.
 
-    Note: the backend's read endpoint returns a schema.org projection and
-    does not expose `hints`, `cookTime`, or step annotations, even though
-    they are accepted on write. Those show as N/A here.
+    Ends with a JSON block whose `steps` use the same shape as upload/update
+    (`{"text": ..., "action": {...} | null}`) plus `hints`, so the recipe can
+    be edited and sent back with update_custom_recipe. Check
+    `annotations_returned`: if false, the backend sent no machine actions and
+    play buttons must come from your saved recipe JSON instead. `hints` is
+    null when the backend didn't return them. cookTime is never returned.
     """
     error, service = await _ensure_connected()
     if error:
@@ -316,10 +320,13 @@ async def get_custom_recipe(recipe_id: str) -> str:
         recipe = await service.get_custom_recipe(recipe_id)
     except Exception as e:
         return f"Failed to get custom recipe: {e}"
+    return _format_custom_recipe("Custom Recipe:", recipe, recipe_id)
 
+
+def _format_custom_recipe(title: str, recipe: dict, recipe_id: str) -> str:
     y = recipe.get("yield") or {}
     lines = [
-        "Custom Recipe:",
+        title,
         "",
         f"Name: {recipe.get('name', '?')}",
         f"ID: {recipe.get('id', recipe_id)}",
@@ -334,16 +341,62 @@ async def get_custom_recipe(recipe_id: str) -> str:
         for ing in recipe["ingredients"]:
             lines.append(f"  • {ing}")
         lines.append("")
-    if recipe.get("instructions"):
+    steps = recipe.get("steps") or []
+    if steps:
         lines.append("Steps:")
-        for i, step in enumerate(recipe["instructions"], 1):
-            lines.append(f"{i}. {step}")
+        for i, step in enumerate(steps, 1):
+            marker = " ▶" if step.get("action") else ""
+            lines.append(f"{i}. {step['text']}{marker}")
         lines.append("")
-    lines.append("Hints: N/A (not exposed by read endpoint)")
-    lines.append("Cook Time: N/A (not exposed by read endpoint)")
+    hints = recipe.get("hints")
+    if hints:
+        lines.append("Hints:")
+        for h in hints:
+            lines.append(f"  • {h}")
+    else:
+        lines.append("Hints: none returned")
+    lines.append(
+        "Machine actions returned: "
+        + ("yes (▶ marks steps with a play button)" if recipe.get("annotations_returned") else "no")
+    )
     if recipe.get("url"):
         lines.append(f"URL: {recipe['url']}")
+    body = {
+        "name": recipe.get("name"),
+        "ingredients": recipe.get("ingredients") or [],
+        "steps": steps,
+        "servings": y.get("value"),
+        "prep_time": max(1, (recipe.get("prepTime") or 0) // 60),
+        "total_time": max(1, (recipe.get("totalTime") or 0) // 60),
+        "hints": hints,
+        "tools": recipe.get("tools") or ["TM7", "TM6", "TM5"],
+        "annotations_returned": recipe.get("annotations_returned", False),
+    }
+    lines += ["", "Recipe JSON:", json.dumps(body, ensure_ascii=False, indent=2)]
     return "\n".join(lines)
+
+
+@mcp.tool()
+async def copy_official_recipe(recipe_id: str, servings: int) -> str:
+    """
+    Copy an official Cookidoo recipe (ID like "r59322") into the user's custom
+    recipes, using Cookidoo's own copy function so the original play buttons
+    and annotations are kept.
+
+    Creates a new custom recipe in the account — only call it when the user
+    asks for a copy. Returns the new recipe in the same format as
+    get_custom_recipe.
+    """
+    error, service = await _ensure_connected()
+    if error:
+        return error
+    if not 1 <= servings <= 20:
+        return "servings must be between 1 and 20"
+    try:
+        recipe = await service.copy_official_recipe(recipe_id, servings)
+    except Exception as e:
+        return f"Failed to copy recipe: {e}"
+    return _format_custom_recipe(f"Copied {recipe_id} into a custom recipe:", recipe, recipe.get("id", "?"))
 
 
 @mcp.tool()
@@ -553,6 +606,71 @@ async def update_custom_recipe(
 
 
 @mcp.tool()
+async def customize_custom_recipe(recipe_id: str, edits_json: str, dry_run: bool = True) -> str:
+    """
+    Surgically edit one of the user's custom recipes (typically a copy made
+    with copy_official_recipe): replace, insert or delete individual steps,
+    change ingredients, hints, name, servings or times.
+
+    Unlike update_custom_recipe, untouched steps and ingredients are sent back
+    exactly as Cookidoo stored them, so their play buttons and ingredient
+    links survive even on official-recipe copies. Only changed fields are
+    PATCHed; photo and cook time are kept.
+
+    dry_run=True (default) changes nothing and returns a preview of the result.
+    Show it to the user, then call again with dry_run=False after approval.
+
+    edits_json: {"edits": [ ... ]} with ops (step numbers are 1-based and
+    always refer to the recipe as read, before any edit in this call):
+      {"op": "replace_step", "step": 7, "with": [<RecipeStep>, ...]}
+      {"op": "insert_steps", "after": 3, "steps": [<RecipeStep>, ...]}   (after 0 = start)
+      {"op": "delete_steps", "steps": [4, 5]}
+      {"op": "replace_ingredient", "old": "<exact line>", "new": "<line>"}
+      {"op": "add_ingredient", "ingredient": "<line>", "after": "<exact line, optional>"}
+      {"op": "remove_ingredient", "ingredient": "<exact line>"}
+      {"op": "set_hints", "hints": ["...", ...]}          ([] clears)
+      {"op": "rename", "name": "..."}
+      {"op": "set_meta", "servings": 4, "prep_time": 20, "total_time": 60}  (minutes)
+    A <RecipeStep> is {"text": "...", "action": {...} | null}, same as upload.
+    The edit is refused if any resulting step still links an ingredient that
+    no longer exists — edit or replace those steps in the same call.
+    """
+    error, service = await _ensure_connected()
+    if error:
+        return error
+    try:
+        edits = RecipeEdits(**json.loads(edits_json)).edits
+    except json.JSONDecodeError as e:
+        return f"Invalid JSON: {e}"
+    except Exception as e:
+        return f"Invalid edits: {e}"
+    try:
+        summary = await service.customize_custom_recipe(recipe_id, edits, dry_run=dry_run)
+    except RecipeEditError as e:
+        return f"Edit refused, nothing changed: {e}"
+    except Exception as e:
+        return f"Customize failed: {e}"
+
+    lines = [
+        ("PREVIEW (nothing changed yet)" if dry_run else "Recipe updated") + f" — {recipe_id}",
+        f"Changed fields: {', '.join(summary['changed_fields']) or 'none'}",
+    ]
+    if summary.get("steps"):
+        lines.append("")
+        lines.append("Resulting steps:")
+        for st in summary["steps"]:
+            mark = " ▶" if st["play_button"] else ""
+            lines.append(f"{st['n']}. [{st['origin']}] {st['text']}{mark}")
+    if summary.get("ingredients"):
+        lines.append("")
+        lines.append("Resulting ingredients:")
+        lines += [f"  • {i}" for i in summary["ingredients"]]
+    if dry_run:
+        lines += ["", "Call again with dry_run=False to apply."]
+    return "\n".join(lines)
+
+
+@mcp.tool()
 async def rename_custom_recipe(recipe_id: str, new_name: str) -> str:
     """
     Rename a custom recipe. Sends a partial PATCH with just the new name; every
@@ -667,25 +785,27 @@ Cookidoo renders a **play button** on a step only when the step carries an *acti
 
 ### Supported action kinds
 
-Each `RecipeStep.action` is one of these three shapes. Times are always in **seconds**.
+Each `RecipeStep.action` is one of these shapes. Times are always in **seconds**.
 
 **1. Standard cooking / mixing (`tts`)** — play button.
 ```json
 {{"kind": "tts",
   "time": <seconds>,
-  "speed": "<label, e.g. '5' or '0.5'>",
-  "temperature": <°C, optional>,
+  "speed": "<'soft' or '0.5'-'10' in steps of 0.5>",
+  "temperature": <°C or "varoma", optional>,
   "direction": "reverse" (optional; omit for the default clockwise direction)}}
 ```
-Only these temperatures are accepted by the backend: `37, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 98, 100, 105, 110, 115, 120`. Other values are rejected and the upload fails.
+Allowed temperatures: `37, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 98, 100, 105, 110, 115, 120` °C, or `"varoma"` (Varoma temperature without steam mode). Speed `"soft"` is the gentle stirring speed. Anything else is rejected at validation.
 
-**2. Varoma steaming (`steaming`)** — play button.
+**2. Steaming (`steaming`)** — play button.
 ```json
 {{"kind": "steaming",
   "time": <seconds>,
-  "speed": "<label, e.g. '2'>"}}
+  "speed": "<label, e.g. '2'>",
+  "accessory": "Varoma" | "SimmeringBasket" | "VaromaAndSimmeringBasket" (optional, default "Varoma"),
+  "direction": "reverse" (optional)}}
 ```
-Varoma is a *steam mode*, not a temperature. Use this when the ingredient sits in the Varoma tray on the lid.
+Steaming is a *mode*. Pick the accessory that holds the food: Varoma tray on the lid, simmering basket in the bowl, or both.
 
 **3. Browning / searing (`browning`)** — play button (Modus Anbraten).
 ```json
@@ -695,14 +815,15 @@ Varoma is a *steam mode*, not a temperature. Use this when the ingredient sits i
   "power": "Intense" or "Gentle"}}
 ```
 
-### Not-yet-supported modes (write as prose, no action)
-
-The TM7 also has these modes; the server has no structured shape for them yet, so they cannot render a play button. Write them as prose steps and let the user set them on the device by hand:
-
-- Fermenting / proofing (WARM_UP, 37–90°C)
-- Rice Cooker
-- Turbo / vigorous chopping
-- Dough kneading (Teigknetstufe 🌾)
+**4. Other modes (`dough`, `turbo`, `blend`, `warm_up`, `rice_cooker`)** — EXPERIMENTAL.
+```json
+{{"kind": "dough" | "turbo" | "blend" | "warm_up" | "rice_cooker",
+  "time": <seconds, optional>,
+  "speed": "<label, optional>",
+  "temperature": <°C or "varoma", optional>,
+  "direction": "reverse" (optional)}}
+```
+Which fields each mode needs is not yet confirmed against the backend; give only what the mode obviously uses (e.g. dough → time; warm_up → time + temperature). A rejected shape fails the upload and rolls back. Fermenting has no mode of its own: use `warm_up`.
 
 ### The three hard rules
 
@@ -739,7 +860,7 @@ Write step text in whichever language is natural for the user (their Cookidoo lo
 - Chop onion/garlic/herbs first (speed 5–7, 3–5 sec), then set aside or continue in the bowl.
 - Reverse direction + low speed (1–2) for delicate ingredients you do not want cut.
 - Butterfly whisk for cream, egg whites, whipped butter.
-- Dough-kneading mode (🌾) for any dough.
+- Dough mode (`dough` action) for any dough.
 - Weigh mise en place directly in the mixing bowl (saves washing).
 
 ## 5. Workflow
